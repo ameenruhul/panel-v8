@@ -529,20 +529,9 @@ void manual_touch() {
         manualKey[3].press(false);
     }
 
-    // Arrow button handling
-    if (pressed && manualKeypadKey[3].contains(t_x, t_y)) { // "U" button
-        selected_manual_field = max(1, selected_manual_field - 1); // Decrement, but not below 1
-        if (selected_manual_field == 2) {
-            manual_wet_temp_str = ""; // Clear the wet temperature string
-        }
-        update_field(' '); // Clear the current field
-        delay(100);
-    } else if (pressed && manualKeypadKey[5].contains(t_x, t_y)) { // "D" button
-        selected_manual_field = min(3, selected_manual_field + 1); // Increment, but not above 3
-        if (selected_manual_field == 2) {
-            manual_wet_temp_str = ""; // Clear the wet temperature string
-        }
-        update_field(' '); // Clear the current field
+    // Toggle between dry and wet fields
+    if (pressed && manualKeypadKey[5].contains(t_x, t_y)) { // "D" button
+        selected_manual_field = (selected_manual_field == 1) ? 2 : 1; // Toggle between 1 and 2
         delay(100);
     }
 
@@ -566,7 +555,6 @@ void manual_touch() {
     if(manualKey[3].justReleased()) manualKey[3].drawButton();
     if(manualKey[3].justPressed()) manualKey[3].drawButton(true);
 }
-
 
 // manual field update
 void update_field(char ch) {
