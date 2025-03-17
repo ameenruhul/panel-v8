@@ -467,83 +467,149 @@ void home_touch() {
     if(homeKey[3].justPressed()) homeKey[3].drawButton(true);
 }
 
-// manual touch control function
 void manual_touch() {
-    static unsigned long lastTouchTime = 0;
-    const unsigned long TOUCH_TIMEOUT = 30000; // 30 seconds timeout
-
     bool pressed = tft.getTouch(&t_x, &t_y);
-
-    if (pressed) {
-        lastTouchTime = millis();
-    } else if (millis() - lastTouchTime > TOUCH_TIMEOUT) {
-        // Reset to safe state on timeout
-        selected_manual_field = 1;
-        return;
-    }
 
     // HOME KEY
     if(pressed && manualKey[0].contains(t_x, t_y)){
+        Serial.println("home key pressed");
+        selected_interface = 1;
         manualKey[0].press(true);
-        selected_interface = 1; // Return to home screen
-        delay(100);
-    } else {
+    }
+    else{
         manualKey[0].press(false);
     }
 
-    // SAVE KEY with timeout
+    // SAVE KEY
     if(pressed && manualKey[1].contains(t_x, t_y)){
+        Serial.println("save key pressed");
         manualKey[1].press(true);
-        unsigned long saveStartTime = millis();
-
-        while(millis() - saveStartTime < 5000) { // 5 second timeout for save operation
-            if(manual_dry_temp_str.length() > 0 && manual_wet_temp_str.length() > 0) {
-                limit_db = manual_dry_temp_str.toInt();
-                limit_wb = manual_wet_temp_str.toInt();
-                break;
-            }
-            delay(10);
-        }
-
-        // Update EEPROM with timeout protection
-        writeIntToEEPROM(EEPROM, manual_dry_temp1, limit_db);
-        writeIntToEEPROM(EEPROM, manual_wet_temp1, limit_wb);
-        delay(10);
-    } else {
+    }
+    else{
         manualKey[1].press(false);
     }
 
     // START KEY
     if(pressed && manualKey[2].contains(t_x, t_y)){
+        Serial.println("start key pressed");
         manualKey[2].press(true);
-        // Add start functionality here
-    } else {
+
+        // Confirmation
+        confirmation_screen();
+
+        delay(10);
+        while(1){
+            confirm_touch();
+            if(confirm == 1){
+                confirm = 0;
+                break;
+            }
+            else if(confirm == 2){
+                confirm = 0;
+                selected_interface = 1;
+                return;
+            }
+        }
+
+        int t_hour = 0;
+        int t_min = 0;
+        int t_sec = 0;
+        int t_db = 0;
+        int t_wb = 0;
+        // working code
+        for(int i=0; i<manual_dry_temp_str.length(); i++){
+            int x = manual_dry_temp_str[i] - '0';
+            // if(i != manual_dry_temp_str.length()-1){
+            t_db = t_db * 10;
+            // }
+            t_db += x;
+        }
+        for(int i=0; i<manual_wet_temp_str.length(); i++){
+            int x = manual_wet_temp_str[i] - '0';
+            // if(i != manual_wet_temp_str.length()-1){
+            t_wb = t_wb*10;
+            // }
+            t_wb += x;
+        }
+        // int ct = 0;
+        // for(int i=0; i<manual_time_str.length(); i++){
+        //     if(manual_time_str[i] == ':'){
+        //         ct++;
+        //         continue;
+        //     }
+        //     else {
+        //         if(ct == 0)
+        //             t_hour *= 10;
+        //         else if(ct == 1){
+        //             t_min *= 10;
+        //         }
+        //         else if(ct == 2){
+        //             t_sec *= 10;
+        //         }
+        //     }
+        //     int x = manual_time_str[i] - '0';
+        //     if(ct == 0){
+        //         t_hour += x;
+        //     }
+        //     else if(ct == 1){
+        //         t_min += x;
+        //     }
+        //     else if(ct == 2){
+        //         t_sec += x;
+        //     }
+        // }
+        // if(t_hour > 60) t_hour = 0;
+        // if(t_min >= 60) t_min = 0;
+        // if(t_sec >= 60) t_sec = 0;
+
+        selected_interface = 1;
+        pre_interface = -1;
+        limit_db = t_db;
+        limit_wb = t_wb;
+        // limit_hour = t_hour;
+        // limit_min = t_min;
+        // limit_sec = t_sec;
+        hour = 0;
+        minute = 0;
+        second = 0;
+        selected_mode = 3;
+        cur_time_flag = true;
+        selected_phase = 0;
+        set_dry_temp_str = String(limit_db);
+        set_wet_temp_str = String(limit_wb);
+
+        writeIntToEEPROM(EEPROM, manual_dry_temp1, limit_db);
+        writeIntToEEPROM(EEPROM, manual_wet_temp1, limit_wb);
+
+        writeIntToEEPROM(EEPROM, manual_dry_temp2, limit_db);
+        writeIntToEEPROM(EEPROM, manual_wet_temp2, limit_wb);
+
+        writeIntToEEPROM(EEPROM, flag1, 0);
+        writeIntToEEPROM(EEPROM, flag2, 0);
+        delay(10);
+    }
+    else{
         manualKey[2].press(false);
     }
 
     // RESET KEY
     if(pressed && manualKey[3].contains(t_x, t_y)){
+        Serial.println("reset key pressed");
         manualKey[3].press(true);
-        // Add reset functionality here
-    } else {
+
+        // reseting values
+        pre_interface = 100;
+        selected_interface = 2;
+        selected_manual_field = 1;
+        manual_dry_temp_str = "";
+        manual_wet_temp_str = "";
+        manual_time_str = "";
+        delay(300);
+        tft.fillScreen(TFT_BLACK);
+        field_change_update();
+    }
+    else{
         manualKey[3].press(false);
-    }
-
-    // Toggle between dry and wet fields
-    if (pressed && manualKeypadKey[5].contains(t_x, t_y)) { // "D" button
-        selected_manual_field = (selected_manual_field == 1) ? 2 : 1; // Toggle between 1 and 2
-        delay(100);
-    }
-
-    // Keypad input
-    for (int i = 0; i < 16; i++) {
-        if (pressed && manualKeypadKey[i].contains(t_x, t_y)) {
-            manualKeypadKey[i].press(true);
-            update_field(manualKeypadKeyLabel[i][0]); // Assuming only the first character is the input
-            delay(100);
-        } else {
-            manualKeypadKey[i].press(false);
-        }
     }
 
     if(manualKey[0].justReleased()) manualKey[0].drawButton();
@@ -554,6 +620,246 @@ void manual_touch() {
     if(manualKey[2].justPressed()) manualKey[2].drawButton(true);
     if(manualKey[3].justReleased()) manualKey[3].drawButton();
     if(manualKey[3].justPressed()) manualKey[3].drawButton(true);
+
+    // Keypad key
+    // 1
+    if(pressed && manualKeypadKey[0].contains(t_x, t_y)){
+        Serial.println("1 key pressed");
+        manualKeypadKey[0].press(true);
+
+        // work here
+        update_field('1');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[0].press(false);
+    }
+
+    // 2
+    if(pressed && manualKeypadKey[1].contains(t_x, t_y)){
+        Serial.println("save key pressed");
+        manualKeypadKey[1].press(true);
+
+        // work here
+        update_field('2');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[1].press(false);
+    }
+
+    // 3
+    if(pressed && manualKeypadKey[2].contains(t_x, t_y)){
+        Serial.println("start key pressed");
+        manualKeypadKey[2].press(true);
+
+        // work here
+        update_field('3');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[2].press(false);
+    }
+
+    // U
+    if(pressed && manualKeypadKey[3].contains(t_x, t_y)){
+        Serial.println("reset key pressed");
+        manualKeypadKey[3].press(true);
+
+        // work here
+        selected_manual_field--;
+        if(selected_manual_field < 1) selected_manual_field = 2;
+        field_change_update();
+        delay(100);
+    }
+    else{
+        manualKeypadKey[3].press(false);
+    }
+
+    // 2nd row keypad
+    // 4
+    if(pressed && manualKeypadKey[4].contains(t_x, t_y)){
+        Serial.println("1 key pressed");
+        manualKeypadKey[4].press(true);
+
+        // work here
+        update_field('4');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[4].press(false);
+    }
+
+    // 5
+    if(pressed && manualKeypadKey[5].contains(t_x, t_y)){
+        Serial.println("save key pressed");
+        manualKeypadKey[5].press(true);
+
+        // work here
+        update_field('5');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[5].press(false);
+    }
+
+    // 6
+    if(pressed && manualKeypadKey[6].contains(t_x, t_y)){
+        Serial.println("start key pressed");
+        manualKeypadKey[6].press(true);
+
+        // work here
+        update_field('6');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[6].press(false);
+    }
+
+    // D
+    if(pressed && manualKeypadKey[7].contains(t_x, t_y)){
+        Serial.println("reset key pressed");
+        manualKeypadKey[7].press(true);
+
+        // work here
+        selected_manual_field = (selected_manual_field == 1) ? 2 : 1;
+        field_change_update();
+        delay(100);
+    }
+    else{
+        manualKeypadKey[7].press(false);
+    }
+
+    //3rd keypad row
+    // 7
+    if(pressed && manualKeypadKey[8].contains(t_x, t_y)){
+        Serial.println("1 key pressed");
+        manualKeypadKey[8].press(true);
+
+        // work here
+        update_field('7');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[8].press(false);
+    }
+
+    // 8
+    if(pressed && manualKeypadKey[9].contains(t_x, t_y)){
+        Serial.println("save key pressed");
+        manualKeypadKey[9].press(true);
+
+        // work here
+        update_field('8');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[9].press(false);
+    }
+
+    // 9
+    if(pressed && manualKeypadKey[10].contains(t_x, t_y)){
+        Serial.println("start key pressed");
+        manualKeypadKey[10].press(true);
+
+        // work here
+        update_field('9');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[10].press(false);
+    }
+
+    // <- backspace
+    if(pressed && manualKeypadKey[11].contains(t_x, t_y)){
+        Serial.println("reset key pressed");
+        manualKeypadKey[11].press(true);
+
+        // work here
+        if(selected_manual_field == 1){
+            if(manual_dry_temp_str.length() > 0){
+                // manual_dry_temp_str[manual_dry_temp_str.length()-1] = '\0';
+                // manual_dry_temp_str.setCharAt(manual_dry_temp_str.length() - 1, '\0');
+                manual_dry_temp_str = manual_dry_temp_str.substring(0, manual_dry_temp_str.length() - 1);
+            }
+        }
+        if(selected_manual_field == 2){
+            if(manual_wet_temp_str.length() > 0){
+                // manual_wet_temp_str[manual_wet_temp_str.length()-1] = '\0';
+                // manual_wet_temp_str.setCharAt(manual_wet_temp_str.length() - 1, '\0');
+                manual_wet_temp_str = manual_wet_temp_str.substring(0, manual_wet_temp_str.length() - 1);
+            }
+        }
+        if(selected_manual_field == 3){
+            if(manual_dry_temp_str.length() > 0){
+                // manual_time_str[manual_time_str.length()-1] = '\0';
+                // manual_time_str.setCharAt(manual_time_str.length() - 1, '\0');
+                manual_time_str = manual_time_str.substring(0, manual_time_str.length() - 1);
+            }
+        }
+        field_change_update();
+        delay(100);
+    }
+    else{
+        manualKeypadKey[11].press(false);
+    }
+
+    // 4th keypad row
+    // .
+    if(pressed && manualKeypadKey[12].contains(t_x, t_y)){
+        Serial.println("1 key pressed");
+        manualKeypadKey[12].press(true);
+
+        // work here
+        update_field('.');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[12].press(false);
+    }
+
+    // 0
+    if(pressed && manualKeypadKey[13].contains(t_x, t_y)){
+        Serial.println("save key pressed");
+        manualKeypadKey[13].press(true);
+
+        // work here
+        update_field('0');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[13].press(false);
+    }
+
+    // :
+    if(pressed && manualKeypadKey[14].contains(t_x, t_y)){
+        Serial.println("start key pressed");
+        manualKeypadKey[14].press(true);
+
+        // work here
+        update_field(':');
+        delay(100);
+    }
+    else{
+        manualKeypadKey[14].press(false);
+    }
+
+    // ok
+    if(pressed && manualKeypadKey[15].contains(t_x, t_y)){
+        Serial.println("reset key pressed");
+        manualKeypadKey[15].press(true);
+
+        // work here
+        delay(100);
+    }
+    else{
+        manualKeypadKey[15].press(false);
+    }
+
+    for(int i=0;i<16;i++){
+        if(manualKeypadKey[i].justReleased()) manualKeypadKey[i].drawButton();
+        if(manualKeypadKey[i].justPressed()) manualKeypadKey[i].drawButton(true);
+    }
 }
 
 // manual field update
