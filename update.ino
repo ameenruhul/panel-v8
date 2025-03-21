@@ -1697,7 +1697,7 @@ void handleEEPROMUpdate() {
 }
 
 // Helper function for temperature sensor handling
-void handleTemperatureSensors() {
+/* void handleTemperatureSensors() {
     if(tempF[0] < 10.0 || tempF[1] < 10.0){
         unsigned long sensorCheckStart = millis();
         const unsigned long SENSOR_CHECK_TIMEOUT = 30000;
@@ -1713,7 +1713,7 @@ void handleTemperatureSensors() {
             Serial.println("Warning: Temperature sensors not responding properly");
         }
     }
-}
+} */
 
 // Helper function for timer updates
 void handleTimerUpdate() {
@@ -1881,7 +1881,7 @@ void sensor_warning() {
 // temperature measurement function
 void temp_measure() {
     static uint64_t temp_pre_time = 0;
-    if(millis() - temp_pre_time >= 5000 && selected_interface == 1){
+    if (millis() - temp_pre_time >= 2000) { // Read every 2 seconds
         sensor1.requestTemperatures();
         sensor2.requestTemperatures();
 
@@ -1903,7 +1903,7 @@ void temp_measure() {
         print_db_temp();
         print_wb_temp();
 
-        temp_pre_time = millis();
+        temp_pre_time = millis(); // Update temp_pre_time ALWAYS
     }
 }
 
@@ -2351,7 +2351,7 @@ void loop() {
 
     // Temperature measurement and control
     temp_measure();
-    handleTemperatureSensors();
+    //handleTemperatureSensors();
     temp_control();
 
     // Timer updates
