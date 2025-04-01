@@ -1,0 +1,2072 @@
+#include <FS.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include "Free_Fonts.h" // Make sure you have this font library
+#include <Keypad.h>
+#include <Arduino.h>
+#include <EEPROM.h> // Use the standard EEPROM library interface if using ESP32 internal EEPROM, or keep Wire if using external I2C EEPROM
+
+// --- Constants ---
+#define I2C_EEPROM_ADDR 0x50 // Assuming external I2C EEPROM at this address
+
+// Touch calibration
+#define CALIBRATION_FILE "/TouchCalData1"
+#define REPEAT_CAL false
+
+// Relay pins
+#define relay1 15
+#define relay2 4
+
+// Temp sensor pins
+#define temp1 12
+#define temp2 13
+
+// Buzzer pin
+#define buzzer 3
+
+// Keypad pins
+const byte ROWS = 4;
+const byte COLS = 4;
+byte rowPins[ROWS] = {33, 32, 16, 17};
+byte colPins[COLS] = {14, 27, 26, 25};
+
+// --- EEPROM Addresses ---
+// Regular Power Loss Recovery Addresses (Slot 1 & 2 for wear leveling)
+#define EEPROM_SELECTED_MODE1   0
+#define EEPROM_SELECTED_PHASE1  4
+#define EEPROM_HOUR1            8
+#define EEPROM_MIN1             12
+#define EEPROM_SEC1             16
+#define EEPROM_LIMIT_HOUR1      20
+#define EEPROM_LIMIT_MIN1       24
+#define EEPROM_LIMIT_SEC1       28
+#define EEPROM_MANUAL_DB1       32
+#define EEPROM_MANUAL_WB1       36
+#define EEPROM_FLAG1            40 // Indicates if Slot 1 is valid (e.g., value 200)
+
+#define EEPROM_SELECTED_MODE2   50
+#define EEPROM_SELECTED_PHASE2  54
+#define EEPROM_HOUR2            58
+#define EEPROM_MIN2             62
+#define EEPROM_SEC2             66
+#define EEPROM_LIMIT_HOUR2      70
+#define EEPROM_LIMIT_MIN2       74
+#define EEPROM_LIMIT_SEC2       78
+#define EEPROM_MANUAL_DB2       82
+#define EEPROM_MANUAL_WB2       86
+#define EEPROM_FLAG2            90 // Indicates if Slot 2 is valid (e.g., value 200)
+
+// Hold Mode State Addresses
+#define HOLD_EEPROM_SELECTED_MODE   100
+#define HOLD_EEPROM_SELECTED_PHASE  104
+#define HOLD_EEPROM_HOUR            108
+#define HOLD_EEPROM_MINUTE          112
+#define HOLD_EEPROM_SECOND          116
+#define HOLD_EEPROM_LIMIT_HOUR      120
+#define HOLD_EEPROM_LIMIT_MIN       124
+#define HOLD_EEPROM_LIMIT_SEC       128
+#define HOLD_EEPROM_LIMIT_DB        132
+#define HOLD_EEPROM_LIMIT_WB        136
+#define HOLD_EEPROM_FLAG            140 // Indicates if a mode is held (1 = held, 0 = not held)
+
+
+// --- Global Variables ---
+TFT_eSPI tft = TFT_eSPI();
+Keypad keypad = Keypad( makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
+OneWire oneWire1(temp1);
+OneWire oneWire2(temp2);
+DallasTemperature sensor1(&oneWire1);
+DallasTemperature sensor2(&oneWire2);
+
+// State Machine
+enum TouchState {
+    STATE_IDLE,
+    STATE_CONFIRM_WAIT_AUTO,  // Specific confirmation for Auto
+    STATE_CONFIRM_WAIT_RESET, // Specific confirmation for Reset
+    STATE_CONFIRM_WAIT_MANUAL,// Specific confirmation for Manual Start
+    STATE_CONFIRM_WAIT_PHASE, // Specific confirmation for Phase Start
+    STATE_CONFIRM_WAIT_HOLD,  // Specific confirmation for Hold/Resume
+    STATE_PROCESS_RUNNING     // General state when a mode is active
+    // Add other states if needed
+};
+TouchState currentState = STATE_IDLE;
+unsigned long stateStartTime = 0;
+byte confirm = 0; // 0: idle, 1: yes, 2: no
+
+// UI Variables
+uint16_t x = 0, y = 0;
+int textWidth = 60;
+int textHeight = 28;
+#define offset_row 20
+#define offset_col 0.5
+#define LINE tft.setCursor(offset_col, offset_row + tft.getCursorY())
+
+// --- Button Labels & Colors ---
+// Home Screen Buttons (Manual A, Hold B, Phase C, Reset D)
+char homeKeyLabel[4][10] = {"MANUAL A", "HOLD B", "PHASE C", "RESET D"}; // Adjusted size for "RESUME B"
+char homeKeyResumeLabel[10] = "RESUME B";
+
+#define CUSTOM_PURPLE tft.color565(150, 0, 150) // Adjusted Purple
+#define CUSTOM_LIGHT_PINK tft.color565(255, 182, 193) // Light Pink
+#define CUSTOM_LIGHT_RED tft.color565(255, 105, 97) // Light Red
+#define CUSTOM_LIGHT_BLUE tft.color565(173, 216, 230) // Light Blue
+#define CUSTOM_ORANGE tft.color565(255, 165, 0) // Orange for Resume
+
+uint16_t homeKeyColor[4] = {CUSTOM_PURPLE, CUSTOM_LIGHT_PINK, CUSTOM_LIGHT_RED, CUSTOM_LIGHT_BLUE};
+TFT_eSPI_Button homeKey[4];
+
+// Manual Keypad Buttons
+char* manualKeypadKeyLabel[16] = {"1", "2", "3", "U",
+                                   "4", "5", "6", "D",
+                                   "7", "8", "9", "<-",
+                                   ".", "0", ":", "OK"};
+TFT_eSPI_Button manualKeypadKey[16];
+
+// Manual Screen Buttons
+char* manualKeyLabel[4] = {"HOME A", "START B", "<-- C", "RESET D"}; // Added D for consistency
+TFT_eSPI_Button manualKey[4];
+
+// Manual Phase Buttons (Removed as they seemed less integrated, simplify)
+// TFT_eSPI_Button manualPhaseKey[4];
+// char* manualPhaseKeyLabel[4] = {"YELLOW", "LAMINA", "COLOR F.", "STEAM"};
+
+// Phase Screen Buttons
+char* phaseKeyLabel[6] = {"YELLOW 1", "LAMINA 2", "COLOR FIX 3", "STEAM 4", "START A", "HOME B"};
+uint16_t phaseKeyColor[6] = {TFT_MAGENTA, TFT_MAGENTA, TFT_MAGENTA, TFT_MAGENTA, // Use Magenta for phases
+                             CUSTOM_PURPLE, CUSTOM_LIGHT_RED};
+TFT_eSPI_Button phaseKey[6];
+
+// Confirm Screen Buttons
+TFT_eSPI_Button confirmKey[2];
+
+// --- Controller Variables ---
+uint8_t pre_interface = 0;
+uint8_t selected_interface = 1; // 1: Home, 2: Manual, 3: Phase, 4: Confirm
+uint8_t selected_manual_field = 1; // 1: Dry, 2: Wet
+byte temp_phase_select = 0; // For phase selection screen
+
+// Input Strings
+String manual_dry_temp_str = "";
+String manual_wet_temp_str = "";
+// String manual_time_str = ""; // Manual time input removed for simplification, assume Manual runs indefinitely until stopped/Reset
+String phase_time_value_str = "00:00:00"; // Display selected phase time
+
+// Display Strings
+String dry_temp_str = " -- F";
+String wet_temp_str = " -- F";
+String set_dry_temp_str = " -- F";
+String set_wet_temp_str = " -- F";
+String home_cur_time_str = "00:00:00";
+String home_limit_time_str = "00:00:00";
+char* phase_label[5] = {"NO PHASE", "YELLOWING", "LAMINA", "COLOR FIX", "STEAM"};
+char* mode_label[4] = {"IDLE", "AUTO", "PHASE", "MANUAL"}; // Changed NO MODE to IDLE
+
+// Process State Variables
+uint64_t cur_time = 0;
+uint64_t pre_time = 0; // For 1-second timer
+uint64_t pre_eeprom_time = 0; // For EEPROM saving interval
+
+uint8_t second = 0;
+uint8_t minute = 0;
+uint8_t hour = 0;
+
+uint8_t limit_sec = 0;
+uint8_t limit_min = 0;
+uint8_t limit_hour = 0;
+
+int limit_db = 0; // Target Dry Bulb
+int limit_wb = 0; // Target Wet Bulb
+
+byte selected_mode = 0;     // 0: Idle, 1: Auto, 2: Phase, 3: Manual
+byte selected_phase = 0;    // 0: None, 1: Yellow, 2: Lamina, 3: ColorFix, 4: Steam
+byte selected_pre_phase = 0;// Stores previous phase during Auto sequence
+
+bool cur_time_flag = false; // Is the timer currently running for a mode?
+bool alarmable = true;      // Can the phase completion alarm sound?
+bool flip = true;           // For EEPROM wear leveling (alternating slots)
+bool isModeHeld = false;    // Is a mode currently held?
+
+// Temperature Sensor Variables
+float tempF[2] = {0, 0};
+
+// --- Phase Parameters --- (Simplified for clarity, use your original complex arrays if needed)
+// Using phase_temp2 as it seems more complete
+const byte phase_temp2[4][40][2] = { /* Your full temperature data here */
+    // Example structure - Fill with your actual data
+    // Phase 1 (Yellowing) - Up to 40 steps
+    {{95, 92}, {96, 93}, {98, 94}, {99, 95}, {100, 96}, /*...more steps...*/ {100, 96}},
+    // Phase 2 (Lamina)
+    {{100, 96}, {102, 96}, {104, 97}, {106, 97}, {108, 98}, /*...more steps...*/ {120, 100}},
+    // Phase 3 (Color Fixing)
+    {{120, 100}, {122, 100}, {124, 101}, {126, 101}, {128, 102}, /*...more steps...*/ {145, 105}},
+    // Phase 4 (Steam)
+    {{145, 105}, {147, 106}, {151, 107}, {153, 107}, {155, 108}, /*...more steps...*/ {165, 110}}
+};
+
+const byte phase_duration_hour[5] = {0, 5, 11, 13, 11}; // Index 0 is unused
+const byte phase_duration_min[5] = {0, 0, 0, 30, 0};  // Index 0 is unused
+const byte phase_duration_sec[5] = {0, 0, 0, 0, 0};  // Index 0 is unused
+
+// Keypad Map
+char hexaKeys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+// === Function Prototypes ===
+// EEPROM
+void writeIntToEEPROM(int address, int value);
+int readIntFromEEPROM(int address);
+void saveStateToEEPROM(bool useSlot1);
+void check_eeprom_recovery();
+void saveHoldStateToEEPROM();
+void restoreHoldStateFromEEPROM();
+void clearHoldStateInEEPROM();
+
+// Touch & Calibration
+void touch_calibrate();
+
+// UI Screens & Drawing
+void home_screen();
+void manual_screen();
+void phase_screen();
+void confirmation_screen(const char* prompt = "Confirm?"); // Added prompt
+void draw_home_keypad();
+void draw_manual_keypad();
+void draw_manual_key();
+void draw_phase_key();
+void draw_confirm_key();
+void update_ui_elements(); // Central function to update dynamic parts
+
+// UI Element Printers (Specific parts of screens)
+void print_db_temp();
+void print_wb_temp();
+void print_dbset_temp();
+void print_wbset_temp();
+void print_curtime();
+void print_limittime();
+void print_phase();
+void print_mode();
+void print_hold_status(); // New function for "MODE HELD" text
+void print_manual_dry_value();
+void print_manual_wet_value();
+void print_phase_select_value();
+void print_phase_manual_time_value();
+
+// Input Handling
+void home_touch();
+void manual_touch();
+void phase_touch();
+void confirm_touch();
+void keypadEvent(KeypadEvent key);
+void update_field(char ch);
+void field_change_update();
+void update_phase_field();
+void update_phase_time_field();
+
+// Control Logic
+void interface_control();
+void touch_control_router(); // Renamed from touch_control
+void handle_state_machine(); // Renamed from handleStateMachine
+void temp_measure();
+void handleTemperatureSensors();
+void temp_control();
+void phase_control();
+void handleTimerUpdate();
+void handleEEPROMUpdate();
+void resetProcess(); // Central reset function
+
+// Utility
+String time_to_str(uint8_t h, uint8_t m, uint8_t s);
+void warning_section(int ct, int duration = 500); // Shorter default warning
+void sensor_warning();
+
+// === EEPROM Functions (Using Wire for External I2C EEPROM) ===
+void writeIntToEEPROM(int memAddress, int data) {
+    // External I2C EEPROM Write (Keep your original if it works)
+    Wire.beginTransmission(I2C_EEPROM_ADDR);
+    Wire.write((byte)(memAddress >> 8));   // High byte of address
+    Wire.write((byte)(memAddress & 0xFF)); // Low byte of address
+
+    Wire.write((byte)((data >> 24) & 0xFF));
+    Wire.write((byte)((data >> 16) & 0xFF));
+    Wire.write((byte)((data >> 8) & 0xFF));
+    Wire.write((byte)(data & 0xFF));
+
+    byte error = Wire.endTransmission();
+    if (error != 0) {
+        Serial.print("EEPROM write error at addr ");
+        Serial.print(memAddress);
+        Serial.print(": ");
+        Serial.println(error);
+    }
+    delay(10); // Crucial delay for EEPROM write cycle
+}
+
+int readIntFromEEPROM(int memAddress) {
+    // External I2C EEPROM Read (Keep your original if it works)
+    int value = 0; // Default to 0 if read fails
+
+    Wire.beginTransmission(I2C_EEPROM_ADDR);
+    Wire.write((byte)(memAddress >> 8));   // High byte of address
+    Wire.write((byte)(memAddress & 0xFF)); // Low byte of address
+    byte error = Wire.endTransmission();
+     if (error != 0) {
+        Serial.print("EEPROM read error (addr) at ");
+        Serial.print(memAddress);
+        Serial.print(": ");
+        Serial.println(error);
+        return 0; // Return 0 on address error
+    }
+
+    Wire.requestFrom(I2C_EEPROM_ADDR, 4); // Request 4 bytes
+
+    if (Wire.available() == 4) {
+        value = (Wire.read() << 24);
+        value |= (Wire.read() << 16);
+        value |= (Wire.read() << 8);
+        value |= Wire.read();
+    } else {
+         Serial.print("EEPROM read error (data) at addr ");
+         Serial.println(memAddress);
+         value = 0; // Return 0 if not enough bytes read
+    }
+    return value;
+}
+
+// Saves the *current running state* for power loss recovery
+void saveStateToEEPROM(bool useSlot1) {
+    int modeAddr, phaseAddr, hAddr, mAddr, sAddr, lhAddr, lmAddr, lsAddr, dbAddr, wbAddr, flagAddr;
+
+    if (useSlot1) {
+        modeAddr = EEPROM_SELECTED_MODE1; phaseAddr = EEPROM_SELECTED_PHASE1;
+        hAddr = EEPROM_HOUR1; mAddr = EEPROM_MIN1; sAddr = EEPROM_SEC1;
+        lhAddr = EEPROM_LIMIT_HOUR1; lmAddr = EEPROM_LIMIT_MIN1; lsAddr = EEPROM_LIMIT_SEC1;
+        dbAddr = EEPROM_MANUAL_DB1; wbAddr = EEPROM_MANUAL_WB1; flagAddr = EEPROM_FLAG1;
+        // Invalidate slot 2
+        writeIntToEEPROM(EEPROM_FLAG2, 0);
+    } else {
+        modeAddr = EEPROM_SELECTED_MODE2; phaseAddr = EEPROM_SELECTED_PHASE2;
+        hAddr = EEPROM_HOUR2; mAddr = EEPROM_MIN2; sAddr = EEPROM_SEC2;
+        lhAddr = EEPROM_LIMIT_HOUR2; lmAddr = EEPROM_LIMIT_MIN2; lsAddr = EEPROM_LIMIT_SEC2;
+        dbAddr = EEPROM_MANUAL_DB2; wbAddr = EEPROM_MANUAL_WB2; flagAddr = EEPROM_FLAG2;
+        // Invalidate slot 1
+        writeIntToEEPROM(EEPROM_FLAG1, 0);
+    }
+
+    writeIntToEEPROM(modeAddr, selected_mode);
+    writeIntToEEPROM(phaseAddr, selected_phase);
+    writeIntToEEPROM(hAddr, hour);
+    writeIntToEEPROM(mAddr, minute);
+    writeIntToEEPROM(sAddr, second);
+    writeIntToEEPROM(lhAddr, limit_hour);
+    writeIntToEEPROM(lmAddr, limit_min);
+    writeIntToEEPROM(lsAddr, limit_sec);
+
+    // Only save Manual DB/WB if in Manual mode
+    if (selected_mode == 3) {
+        writeIntToEEPROM(dbAddr, limit_db);
+        writeIntToEEPROM(wbAddr, limit_wb);
+    } else {
+         // Write 0 or a specific invalid value if not in manual mode
+         writeIntToEEPROM(dbAddr, 0);
+         writeIntToEEPROM(wbAddr, 0);
+    }
+
+    // Mark this slot as valid
+    writeIntToEEPROM(flagAddr, 200);
+    Serial.println(useSlot1 ? "Saved state to EEPROM Slot 1" : "Saved state to EEPROM Slot 2");
+}
+
+// Checks for and restores state after power loss
+void check_eeprom_recovery() {
+    int flag1_val = readIntFromEEPROM(EEPROM_FLAG1);
+    delay(10); // Delay between reads
+    int flag2_val = readIntFromEEPROM(EEPROM_FLAG2);
+    delay(10);
+
+    int modeAddr, phaseAddr, hAddr, mAddr, sAddr, lhAddr, lmAddr, lsAddr, dbAddr, wbAddr;
+    bool recovered = false;
+
+    // Prioritize Slot 1 if both seem valid (less likely but possible)
+    if (flag1_val == 200) {
+        modeAddr = EEPROM_SELECTED_MODE1; phaseAddr = EEPROM_SELECTED_PHASE1;
+        hAddr = EEPROM_HOUR1; mAddr = EEPROM_MIN1; sAddr = EEPROM_SEC1;
+        lhAddr = EEPROM_LIMIT_HOUR1; lmAddr = EEPROM_LIMIT_MIN1; lsAddr = EEPROM_LIMIT_SEC1;
+        dbAddr = EEPROM_MANUAL_DB1; wbAddr = EEPROM_MANUAL_WB1;
+        recovered = true;
+        Serial.println("Recovering state from EEPROM Slot 1");
+    } else if (flag2_val == 200) {
+        modeAddr = EEPROM_SELECTED_MODE2; phaseAddr = EEPROM_SELECTED_PHASE2;
+        hAddr = EEPROM_HOUR2; mAddr = EEPROM_MIN2; sAddr = EEPROM_SEC2;
+        lhAddr = EEPROM_LIMIT_HOUR2; lmAddr = EEPROM_LIMIT_MIN2; lsAddr = EEPROM_LIMIT_SEC2;
+        dbAddr = EEPROM_MANUAL_DB2; wbAddr = EEPROM_MANUAL_WB2;
+        recovered = true;
+        Serial.println("Recovering state from EEPROM Slot 2");
+    }
+
+    if (recovered) {
+        selected_mode = readIntFromEEPROM(modeAddr); delay(10);
+        selected_phase = readIntFromEEPROM(phaseAddr); delay(10);
+        hour = readIntFromEEPROM(hAddr); delay(10);
+        minute = readIntFromEEPROM(mAddr); delay(10);
+        second = readIntFromEEPROM(sAddr); delay(10);
+        limit_hour = readIntFromEEPROM(lhAddr); delay(10);
+        limit_min = readIntFromEEPROM(lmAddr); delay(10);
+        limit_sec = readIntFromEEPROM(lsAddr); delay(10);
+
+        if (selected_mode == 3) { // If recovered mode was Manual
+            limit_db = readIntFromEEPROM(dbAddr); delay(10);
+            limit_wb = readIntFromEEPROM(wbAddr); delay(10);
+        } else {
+             // If Auto or Phase mode, recalculate setpoints based on recovered time/phase
+             if(selected_mode == 1 || selected_mode == 2) {
+                 if (selected_phase > 0 && selected_phase < 5 && hour < 40) { // Basic bounds check
+                     // Use phase_temp2 based on recovered phase and hour
+                      limit_db = phase_temp2[selected_phase - 1][hour][0];
+                      limit_wb = phase_temp2[selected_phase - 1][hour][1];
+                 } else {
+                     limit_db = 0; // Set to safe values if phase/hour seems invalid
+                     limit_wb = 0;
+                 }
+             } else {
+                 limit_db = 0;
+                 limit_wb = 0;
+             }
+        }
+
+        // Update display strings based on recovered values
+        set_dry_temp_str = String(limit_db) + " F";
+        set_wet_temp_str = String(limit_wb) + " F";
+        home_cur_time_str = time_to_str(hour, minute, second);
+        home_limit_time_str = time_to_str(limit_hour, limit_min, limit_sec);
+
+
+        cur_time_flag = true; // Start the timer
+        alarmable = true; // Re-enable alarm potential
+        pre_eeprom_time = millis(); // Reset EEPROM save timer
+        pre_time = millis();        // Reset 1-sec timer
+
+        Serial.println("EEPROM Recovery successful.");
+        warning_section(2, 200); // Short beeps to indicate recovery
+    } else {
+        Serial.println("No valid state found in EEPROM or flags cleared.");
+        // Ensure flags are cleared if no valid state found
+        writeIntToEEPROM(EEPROM_FLAG1, 0);
+        writeIntToEEPROM(EEPROM_FLAG2, 0);
+    }
+}
+
+// Saves the *current running state* to the HOLD section of EEPROM
+void saveHoldStateToEEPROM() {
+    Serial.println("Saving state to HOLD EEPROM...");
+    writeIntToEEPROM(HOLD_EEPROM_SELECTED_MODE, selected_mode);
+    writeIntToEEPROM(HOLD_EEPROM_SELECTED_PHASE, selected_phase);
+    writeIntToEEPROM(HOLD_EEPROM_HOUR, hour);
+    writeIntToEEPROM(HOLD_EEPROM_MINUTE, minute);
+    writeIntToEEPROM(HOLD_EEPROM_SECOND, second);
+    writeIntToEEPROM(HOLD_EEPROM_LIMIT_HOUR, limit_hour);
+    writeIntToEEPROM(HOLD_EEPROM_LIMIT_MIN, limit_min);
+    writeIntToEEPROM(HOLD_EEPROM_LIMIT_SEC, limit_sec);
+    writeIntToEEPROM(HOLD_EEPROM_LIMIT_DB, limit_db);
+    writeIntToEEPROM(HOLD_EEPROM_LIMIT_WB, limit_wb);
+    writeIntToEEPROM(HOLD_EEPROM_FLAG, 1); // Mark as held
+    Serial.println("HOLD state saved.");
+}
+
+// Restores state from the HOLD section of EEPROM into active variables
+void restoreHoldStateFromEEPROM() {
+     Serial.println("Restoring state from HOLD EEPROM...");
+    selected_mode = readIntFromEEPROM(HOLD_EEPROM_SELECTED_MODE); delay(10);
+    selected_phase = readIntFromEEPROM(HOLD_EEPROM_SELECTED_PHASE); delay(10);
+    hour = readIntFromEEPROM(HOLD_EEPROM_HOUR); delay(10);
+    minute = readIntFromEEPROM(HOLD_EEPROM_MINUTE); delay(10);
+    second = readIntFromEEPROM(HOLD_EEPROM_SECOND); delay(10);
+    limit_hour = readIntFromEEPROM(HOLD_EEPROM_LIMIT_HOUR); delay(10);
+    limit_min = readIntFromEEPROM(HOLD_EEPROM_LIMIT_MIN); delay(10);
+    limit_sec = readIntFromEEPROM(HOLD_EEPROM_LIMIT_SEC); delay(10);
+    limit_db = readIntFromEEPROM(HOLD_EEPROM_LIMIT_DB); delay(10);
+    limit_wb = readIntFromEEPROM(HOLD_EEPROM_LIMIT_WB); delay(10);
+
+    // Update display strings
+    set_dry_temp_str = String(limit_db) + " F";
+    set_wet_temp_str = String(limit_wb) + " F";
+    home_cur_time_str = time_to_str(hour, minute, second);
+    home_limit_time_str = time_to_str(limit_hour, limit_min, limit_sec);
+
+    writeIntToEEPROM(HOLD_EEPROM_FLAG, 0); // Mark as not held anymore
+    Serial.println("HOLD state restored.");
+}
+
+// Clears the hold flag in EEPROM (used on reset/startup)
+void clearHoldStateInEEPROM() {
+    writeIntToEEPROM(HOLD_EEPROM_FLAG, 0);
+    // Optionally clear other HOLD_ addresses too for good measure
+    writeIntToEEPROM(HOLD_EEPROM_SELECTED_MODE, 0);
+    writeIntToEEPROM(HOLD_EEPROM_SELECTED_PHASE, 0);
+    // ... clear others ...
+    Serial.println("Cleared HOLD state in EEPROM.");
+}
+
+// === Touch Calibration ===
+void touch_calibrate() {
+    // ... (Your existing touch_calibrate function - unchanged) ...
+    uint16_t calData[5];
+    uint8_t calDataOK = 0;
+
+    // check file system exists
+    if (!SPIFFS.begin()) {
+        Serial.println("Formatting file system");
+        SPIFFS.format();
+        SPIFFS.begin();
+    }
+
+    // check if calibration file exists and size is correct
+    if (SPIFFS.exists(CALIBRATION_FILE)) {
+        if (REPEAT_CAL) {
+            // Delete if we want to re-calibrate
+            SPIFFS.remove(CALIBRATION_FILE);
+        } else {
+            File f = SPIFFS.open(CALIBRATION_FILE, "r");
+            if (f) {
+                if (f.readBytes((char *)calData, 14) == 14)
+                    calDataOK = 1;
+                f.close();
+            }
+        }
+    }
+
+    if (calDataOK && !REPEAT_CAL) {
+        // calibration data valid
+        tft.setTouch(calData);
+    } else {
+        // data not valid so recalibrate
+        tft.fillScreen(TFT_BLACK);
+        tft.setCursor(20, 0);
+        tft.setTextFont(2);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+        tft.println("Touch corners as indicated");
+
+        tft.setTextFont(1);
+        tft.println();
+
+        if (REPEAT_CAL) {
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.println("Set REPEAT_CAL to false to stop this running again!");
+        }
+
+        tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 15);
+
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.println("Calibration complete!");
+
+        // store data
+        File f = SPIFFS.open(CALIBRATION_FILE, "w");
+        if (f) {
+            f.write((const unsigned char *)calData, 14);
+            f.close();
+        }
+    }
+}
+
+
+// === Time String Conversion ===
+String time_to_str(uint8_t h, uint8_t m, uint8_t s) {
+    // ... (Your existing time_to_str function - unchanged) ...
+    String x = "";
+    if(h <= 9){
+        x += '0';
+    }
+    x += String(h) + ':';
+
+    if(m <= 9) {
+        x += '0';
+    }
+    x += String(m) + ':';
+
+    if(s <= 9){
+        x += '0';
+    }
+    x += String(s);
+
+    return x;
+}
+
+// === UI Drawing Functions ===
+
+// Draw Home Keypad - Handles Hold/Resume button text/color
+void draw_home_keypad() {
+    int home_key_col_offset = 62;
+    int home_key_row_offset = 250;
+    int home_key_width = 100;
+    int home_key_height = 23;
+    int home_key_space_x = 10;
+    int home_key_space_y = 12;
+
+    tft.setFreeFont(FSB9); // Set font once
+
+    for (uint8_t row = 0; row < 2; row++) {
+        for (uint8_t col = 0; col < 2; col++) {
+            uint8_t b = col + row * 2;
+            char* label = homeKeyLabel[b];
+            uint16_t color = homeKeyColor[b];
+
+            // Special handling for the Hold/Resume button (index 1)
+            if (b == 1) { // Index 1 is HOLD/RESUME B
+                if (isModeHeld) {
+                    label = homeKeyResumeLabel;
+                    color = CUSTOM_ORANGE; // Use Orange for Resume
+                } else {
+                    label = homeKeyLabel[b]; // Should be "HOLD B"
+                    color = homeKeyColor[b]; // Should be CUSTOM_LIGHT_PINK
+                }
+            }
+
+            homeKey[b].initButton(&tft, home_key_col_offset + col * (home_key_width + home_key_space_x),
+                                   home_key_row_offset + row * (home_key_height + home_key_space_y),
+                                   home_key_width, home_key_height, TFT_WHITE, color, TFT_BLACK, // Text color black
+                                   label, 1);
+            homeKey[b].drawButton();
+        }
+    }
+}
+
+void draw_manual_keypad() {
+    // ... (Your existing draw_manual_keypad function - unchanged) ...
+    int home_key_col_offset = 18;
+    int home_key_row_offset = 110; // Moved up slightly
+    int home_key_width = 35; // Slightly wider
+    int home_key_height = 30;
+    int home_key_space_x = 8;
+    int home_key_space_y = 8;
+    tft.setFreeFont(FSB9);
+    for (uint8_t row = 0; row < 4; row++) {
+        for (uint8_t col = 0; col < 4; col++) {
+            uint8_t b = col + row * 4;
+            manualKeypadKey[b].initButton(&tft, home_key_col_offset + col * (home_key_width + home_key_space_x),
+                                          home_key_row_offset + row * (home_key_height + home_key_space_y),
+                                          home_key_width, home_key_height, TFT_WHITE, TFT_DARKGREY, TFT_WHITE, // Dark grey background
+                                          manualKeypadKeyLabel[b], 1);
+            manualKeypadKey[b].drawButton();
+        }
+    }
+}
+
+void draw_manual_key() {
+     // ... (Your existing draw_manual_key function - unchanged, maybe adjust layout) ...
+    int key_col_offset = 195; // Positioned to the right
+    int key_row_offset = 110; // Align with keypad top
+    int key_width = 100;
+    int key_height = 30; // Same height as keypad keys
+    int key_space_y = 8;
+
+    tft.setFreeFont(FSB9);
+    for (uint8_t i = 0; i < 4; i++) {
+         manualKey[i].initButton(&tft, key_col_offset,
+                                 key_row_offset + i * (key_height + key_space_y),
+                                 key_width, key_height, TFT_WHITE, homeKeyColor[i % 4], TFT_BLACK, // Cycle through home colors
+                                 manualKeyLabel[i], 1);
+         manualKey[i].drawButton();
+     }
+}
+
+
+void draw_phase_key() {
+    // ... (Your existing draw_phase_key function - maybe adjust layout) ...
+    int key_col_offset = 20;  // Left side for phase selection
+    int key_row_offset = 90;
+    int key_width = 135; // Wider phase buttons
+    int key_height = 30;
+    int key_space_y = 10;
+
+    int action_key_col_offset = 175; // Right side for Start/Home
+    int action_key_row_offset = 170; // Below phase buttons
+    int action_key_width = 100;
+    int action_key_height = 30;
+    int action_key_space_y = 10;
+
+    tft.setFreeFont(FSB9);
+
+    // Phase Selection Buttons (0-3)
+    for (uint8_t i = 0; i < 4; i++) {
+        phaseKey[i].initButton(&tft, key_col_offset,
+                               key_row_offset + i * (key_height + key_space_y),
+                               key_width, key_height, TFT_WHITE, phaseKeyColor[i], TFT_BLACK,
+                               phaseKeyLabel[i], 1);
+        phaseKey[i].drawButton();
+    }
+
+    // Start Button (4)
+    phaseKey[4].initButton(&tft, action_key_col_offset, action_key_row_offset,
+                           action_key_width, action_key_height, TFT_WHITE, phaseKeyColor[4], TFT_BLACK,
+                           phaseKeyLabel[4], 1);
+    phaseKey[4].drawButton();
+
+     // Home Button (5)
+    phaseKey[5].initButton(&tft, action_key_col_offset, action_key_row_offset + (action_key_height + action_key_space_y),
+                           action_key_width, action_key_height, TFT_WHITE, phaseKeyColor[5], TFT_BLACK,
+                           phaseKeyLabel[5], 1);
+    phaseKey[5].drawButton();
+}
+
+void draw_confirm_key() {
+     // ... (Your existing draw_confirm_key function - unchanged) ...
+    int home_key_width = 100;
+    int home_key_height = 30; // Slightly taller
+    int confirm_y = 170;
+
+    tft.setFreeFont(FSB9);
+
+    // YES (*) - Greenish color
+    confirmKey[0].initButton(&tft, 55, confirm_y, home_key_width, home_key_height,
+                             TFT_WHITE, TFT_GREEN, TFT_BLACK, "YES (*)", 1);
+
+    // NO (#) - Reddish color
+    confirmKey[1].initButton(&tft, 55 + home_key_width + 15, confirm_y, home_key_width, home_key_height,
+                             TFT_WHITE, TFT_RED, TFT_BLACK, "NO (#)", 1);
+
+    confirmKey[0].drawButton();
+    confirmKey[1].drawButton();
+}
+
+// === UI Screens ===
+
+void home_screen() {
+    tft.fillScreen(TFT_BLACK);
+    pre_interface = 0; // Force redraw next time if switching back
+
+    // Static Labels (Draw only once)
+    tft.setFreeFont(FF1); // Use a suitable fixed-width font if possible
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    // Row 1
+    tft.drawRect(offset_col, offset_row, textWidth, textHeight, TFT_WHITE);
+    tft.drawString("DB", offset_col+15, offset_row+7, GFXFF); // Center text
+    tft.drawRect(offset_col + textWidth * 2 + 2, offset_row, textWidth, textHeight, TFT_WHITE);
+    tft.drawString("WB", offset_col + textWidth * 2 + 17, offset_row+7, GFXFF); // Center text
+
+    // Row 2
+    tft.drawRect(offset_col, offset_row + textHeight + 5, textWidth, textHeight, TFT_WHITE);
+    tft.drawString("DB SET", offset_col+3, offset_row + textHeight + 5 + 7, GFXFF);
+    tft.drawRect(offset_col + textWidth * 2 + 2, offset_row + textHeight + 5, textWidth, textHeight, TFT_WHITE);
+    tft.drawString("WB SET", offset_col + textWidth * 2 + 3, offset_row + textHeight + 5 + 7, GFXFF);
+
+    // Row 3
+    tft.drawRect(offset_col, offset_row + (textHeight + 5) * 2, textWidth + 60, textHeight, TFT_WHITE);
+    tft.drawString("CURR TIME", offset_col+3, offset_row + 7 + (textHeight + 5) * 2, GFXFF);
+
+    // Row 4
+    tft.drawRect(offset_col, offset_row + (textHeight + 5) * 3, textWidth + 60, textHeight, TFT_WHITE);
+    tft.drawString("LIMIT TIME", offset_col+3, offset_row + 7 + (textHeight + 5) * 3, GFXFF);
+
+    // Row 5
+    tft.drawRect(offset_col, offset_row + (textHeight + 5) * 4, textWidth + 60, textHeight, TFT_WHITE);
+    tft.drawString("PHASE", offset_col+3, offset_row + 7 + (textHeight + 5) * 4, GFXFF);
+
+    // Row 6
+    tft.drawRect(offset_col, offset_row + (textHeight + 5) * 5, textWidth + 60, textHeight, TFT_WHITE);
+    tft.drawString("MODE", offset_col+3, offset_row + 7 + (textHeight + 5) * 5, GFXFF);
+
+    // Dynamic Values (update frequently)
+    update_ui_elements();
+
+    // Buttons
+    draw_home_keypad();
+}
+
+void manual_screen() {
+    tft.fillScreen(TFT_BLACK);
+     pre_interface = 0; // Force redraw
+
+    // Static Labels
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    // DRY Label Box
+    tft.drawRect(offset_col + 2, offset_row - 5, textWidth, textHeight, TFT_WHITE);
+    tft.drawString("DRY", offset_col + 15, offset_row - 5 + 7, GFXFF); // Centered
+
+    // WET Label Box
+    tft.drawRect(offset_col + 2, offset_row - 5 + textHeight + 5, textWidth, textHeight, TFT_WHITE);
+    tft.drawString("WET", offset_col + 15, offset_row - 5 + textHeight + 5 + 7, GFXFF); // Centered
+
+    // Initial Value Prints
+    field_change_update(); // Draws the value boxes and initial values
+
+    // Keypads
+    draw_manual_keypad();
+    draw_manual_key();
+}
+
+void phase_screen() {
+    tft.fillScreen(TFT_BLACK);
+    pre_interface = 0; // Force redraw
+
+    // Static Labels
+    tft.setFreeFont(FSB9);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("PHASE:", offset_col + 5, offset_row + 7, GFXFF);
+    tft.drawString("TIME :", offset_col + 5, offset_row + 7 + textHeight + 10, GFXFF);
+
+    // Initial Value Prints
+    temp_phase_select = 0; // Reset selection on screen entry
+    update_phase_field();
+    update_phase_time_field();
+
+    // Buttons
+    draw_phase_key();
+}
+
+void confirmation_screen(const char* prompt) {
+    tft.fillScreen(TFT_BLACK);
+    pre_interface = 0; // Force redraw
+
+    // Prompt Label
+    tft.setFreeFont(FSB12); // Larger font for confirmation
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK); // Yellow prompt
+    tft.setTextDatum(MC_DATUM); // Middle Center alignment
+    tft.drawString(prompt, tft.width() / 2, 110); // Center the text
+    tft.setTextDatum(TL_DATUM); // Reset text datum
+
+    // Buttons
+    draw_confirm_key();
+}
+
+// === UI Element Update Functions ===
+
+// Update all dynamic elements on the home screen
+void update_ui_elements() {
+    print_db_temp();
+    print_wb_temp();
+    print_dbset_temp();
+    print_wbset_temp();
+    print_curtime();
+    print_limittime();
+    print_phase();
+    print_mode();
+    print_hold_status(); // Add this
+}
+
+void print_db_temp() {
+    int val_x = offset_col + textWidth + 1;
+    int val_y = offset_row;
+    tft.fillRect(val_x + 1, val_y + 1, textWidth - 2, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK); // Cyan for actual temp
+    tft.drawString(dry_temp_str, val_x + 5, val_y + 7, GFXFF);
+}
+
+void print_wb_temp() {
+    int val_x = offset_col + textWidth * 3 + 3;
+    int val_y = offset_row;
+    tft.fillRect(val_x + 1, val_y + 1, textWidth - 2, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(wet_temp_str, val_x + 5, val_y + 7, GFXFF);
+}
+
+void print_dbset_temp() {
+    int val_x = offset_col + textWidth + 1;
+    int val_y = offset_row + textHeight + 5;
+    tft.fillRect(val_x + 1, val_y + 1, textWidth - 2, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK); // Green for setpoints
+    tft.drawString(set_dry_temp_str, val_x + 5, val_y + 7, GFXFF);
+}
+
+void print_wbset_temp() {
+    int val_x = offset_col + textWidth * 3 + 3;
+    int val_y = offset_row + textHeight + 5;
+    tft.fillRect(val_x + 1, val_y + 1, textWidth - 2, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString(set_wet_temp_str, val_x + 5, val_y + 7, GFXFF);
+}
+
+void print_curtime() {
+    int val_x = offset_col + textWidth + 60 + 2;
+    int val_y = offset_row + (textHeight + 5) * 2;
+    int val_w = tft.width() - val_x - 5; // Calculate width to edge
+    home_cur_time_str = time_to_str(hour, minute, second);
+    tft.fillRect(val_x, val_y + 1, val_w, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FSB12); // Larger font for time
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(home_cur_time_str, val_x + 5, val_y + 5, GFXFF); // Adjusted y for font
+}
+
+void print_limittime() {
+    int val_x = offset_col + textWidth + 60 + 2;
+    int val_y = offset_row + (textHeight + 5) * 3;
+    int val_w = tft.width() - val_x - 5;
+    home_limit_time_str = time_to_str(limit_hour, limit_min, limit_sec);
+    tft.fillRect(val_x, val_y + 1, val_w, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FSB12);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(home_limit_time_str, val_x + 5, val_y + 5, GFXFF); // Adjusted y for font
+}
+
+void print_phase() {
+    int val_x = offset_col + textWidth + 60 + 2;
+    int val_y = offset_row + (textHeight + 5) * 4;
+    int val_w = tft.width() - val_x - 5;
+    tft.fillRect(val_x, val_y + 1, val_w, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK); // Yellow for phase/mode
+    tft.drawString(phase_label[selected_phase], val_x + 5, val_y + 7, GFXFF);
+}
+
+void print_mode() {
+    int val_x = offset_col + textWidth + 60 + 2;
+    int val_y = offset_row + (textHeight + 5) * 5;
+    int val_w = tft.width() - val_x - 5;
+    tft.fillRect(val_x, val_y + 1, val_w, textHeight - 2, TFT_BLACK); // Clear area
+    tft.setFreeFont(FF1);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(mode_label[selected_mode], val_x + 5, val_y + 7, GFXFF);
+}
+
+// New function to display "MODE HELD" status
+void print_hold_status() {
+    int status_x = tft.width() - 85; // Position top right
+    int status_y = 5;
+    int status_w = 80;
+    int status_h = 15;
+
+    tft.setFreeFont(FF1); // Small font
+    if (isModeHeld) {
+        tft.fillRect(status_x, status_y, status_w, status_h, CUSTOM_ORANGE);
+        tft.setTextColor(TFT_BLACK); // Black text on orange bg
+        tft.drawString("MODE HELD", status_x + 5, status_y + 4, GFXFF);
+    } else {
+        // Clear the area if not held
+        tft.fillRect(status_x, status_y, status_w, status_h, TFT_BLACK);
+    }
+}
+
+void print_manual_dry_value() {
+    int box_x = offset_col + textWidth + 3 + 2;
+    int box_y = offset_row - 5;
+    int box_w = tft.width() - box_x - 5; // Width to edge
+    int box_h = textHeight;
+
+    // Clear existing value area inside the box
+    tft.fillRect(box_x + 1, box_y + 1, box_w - 2, box_h - 2, TFT_BLACK);
+
+    tft.setFreeFont(FSB9);
+    if (selected_manual_field == 1) {
+        tft.drawRect(box_x, box_y, box_w, box_h, TFT_GREEN); // Highlight border
+        tft.setTextColor(TFT_WHITE, TFT_RED); // Selected text color/bg
+        tft.fillRect(box_x + 1, box_y + 1, box_w - 2, box_h - 2, TFT_RED); // Selected BG
+    } else {
+        tft.drawRect(box_x, box_y, box_w, box_h, TFT_WHITE); // Normal border
+        tft.setTextColor(TFT_WHITE, TFT_BLACK); // Normal text color/bg
+    }
+    tft.drawString(manual_dry_temp_str, box_x + 15, box_y + 7, GFXFF);
+}
+
+void print_manual_wet_value() {
+    int box_x = offset_col + textWidth + 3 + 2;
+    int box_y = offset_row - 5 + textHeight + 5;
+    int box_w = tft.width() - box_x - 5;
+    int box_h = textHeight;
+
+    tft.fillRect(box_x + 1, box_y + 1, box_w - 2, box_h - 2, TFT_BLACK);
+
+    tft.setFreeFont(FSB9);
+     if (selected_manual_field == 2) {
+        tft.drawRect(box_x, box_y, box_w, box_h, TFT_GREEN);
+        tft.setTextColor(TFT_WHITE, TFT_RED);
+        tft.fillRect(box_x + 1, box_y + 1, box_w - 2, box_h - 2, TFT_RED);
+    } else {
+        tft.drawRect(box_x, box_y, box_w, box_h, TFT_WHITE);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+    tft.drawString(manual_wet_temp_str, box_x + 15, box_y + 7, GFXFF);
+}
+
+void print_phase_select_value() {
+    int val_x = offset_col + 80;
+    int val_y = offset_row + 7;
+    int val_w = 160;
+    int val_h = textHeight;
+
+    tft.fillRect(val_x, val_y - 7, val_w, val_h + 4, TFT_BLACK); // Clear area
+    tft.setFreeFont(FSB9);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(phase_label[temp_phase_select], val_x, val_y, GFXFF);
+}
+
+void print_phase_manual_time_value() {
+    int val_x = offset_col + 80;
+    int val_y = offset_row + 7 + textHeight + 10;
+    int val_w = 160;
+    int val_h = textHeight;
+
+    tft.fillRect(val_x, val_y - 7, val_w, val_h + 4, TFT_BLACK); // Clear area
+    tft.setFreeFont(FSB9);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(phase_time_value_str, val_x, val_y, GFXFF);
+}
+
+
+// === Input Handling Functions ===
+
+// Handles touch events on the home screen
+void home_touch() {
+    uint16_t t_x, t_y; // Local touch coordinates for this function
+    bool pressed = tft.getTouch(&t_x, &t_y);
+
+    // Press styling for all buttons
+    for (int i = 0; i < 4; i++) {
+        if (pressed && homeKey[i].contains(t_x, t_y)) {
+            homeKey[i].press(true);
+        } else {
+            homeKey[i].press(false);
+        }
+    }
+
+    // Button Actions (on release is generally better to avoid double triggers)
+    // MANUAL A (Index 0)
+    if (homeKey[0].justReleased()) {
+        homeKey[0].drawButton(); // Redraw normal state
+        Serial.println("Manual key pressed");
+        if (isModeHeld) {
+             // Allow starting manual temporarily even if held
+             manual_dry_temp_str = ""; // Clear previous manual inputs
+             manual_wet_temp_str = "";
+             selected_manual_field = 1;
+             selected_interface = 2; // Go to Manual Screen
+        } else {
+             manual_dry_temp_str = "";
+             manual_wet_temp_str = "";
+             selected_manual_field = 1;
+             selected_interface = 2;
+        }
+    }
+    if (homeKey[0].justPressed()) homeKey[0].drawButton(true);
+
+    // HOLD/RESUME B (Index 1)
+    if (homeKey[1].justReleased()) {
+        homeKey[1].drawButton(); // Redraw normal (or resume) state
+        Serial.println("Hold/Resume key pressed");
+        if (isModeHeld) { // --- RESUME ---
+            Serial.println("Attempting to Resume...");
+            restoreHoldStateFromEEPROM();
+            isModeHeld = false;
+            cur_time_flag = true; // Resume timer
+            alarmable = true;     // Re-enable alarms
+            digitalWrite(relay1, LOW); // Ensure relays are off initially after resume
+            digitalWrite(relay2, LOW);
+            pre_time = millis(); // Reset timers
+            pre_eeprom_time = millis();
+            selected_interface = 1; // Stay on home screen
+            pre_interface = 0;      // Force redraw of home screen with new state
+        } else { // --- HOLD ---
+            if (selected_mode != 0 && cur_time_flag) { // Only hold if a mode is running
+                 Serial.println("Attempting to Hold...");
+                 saveHoldStateToEEPROM();
+                 isModeHeld = true;
+                 cur_time_flag = false; // Stop timer for the held process
+
+                 // Reset current state for temporary operation (don't change held vars)
+                 byte held_mode = selected_mode; // Store temporarily
+                 selected_mode = 0; // Set current mode to Idle
+                 selected_phase = 0;
+                 hour = 0; minute = 0; second = 0;
+                 limit_hour = 0; limit_min = 0; limit_sec = 0;
+                 limit_db = 0; limit_wb = 0;
+                 set_dry_temp_str = " -- F";
+                 set_wet_temp_str = " -- F";
+                 home_cur_time_str = "00:00:00";
+                 home_limit_time_str = "00:00:00";
+
+                 digitalWrite(relay1, LOW); // Turn off relays
+                 digitalWrite(relay2, LOW);
+
+                 selected_interface = 1; // Stay on home screen
+                 pre_interface = 0;      // Force redraw to show "MODE HELD" & "RESUME" button
+                 warning_section(1, 300); // Short beep for confirmation
+            } else {
+                Serial.println("Hold key pressed, but no mode is running.");
+                warning_section(2, 100); // Double short beep for error/nothing to hold
+            }
+        }
+    }
+     if (homeKey[1].justPressed()) {
+         // Redraw pressed state (label/color depends on isModeHeld)
+        char* label = isModeHeld ? homeKeyResumeLabel : homeKeyLabel[1];
+        uint16_t color = isModeHeld ? CUSTOM_ORANGE : homeKeyColor[1];
+        homeKey[1].drawButton(true, label); // Draw with correct label when pressed
+     }
+
+
+    // PHASE C (Index 2)
+    if (homeKey[2].justReleased()) {
+        homeKey[2].drawButton();
+        Serial.println("Phase key pressed");
+        // Allow entering Phase selection even if held
+        selected_interface = 3; // Go to Phase Screen
+    }
+    if (homeKey[2].justPressed()) homeKey[2].drawButton(true);
+
+    // RESET D (Index 3)
+    if (homeKey[3].justReleased()) {
+        homeKey[3].drawButton();
+        Serial.println("Reset key pressed");
+        confirmation_screen("RESET System?"); // Ask for confirmation
+        currentState = STATE_CONFIRM_WAIT_RESET;
+        stateStartTime = millis();
+        selected_interface = 4; // Go to Confirmation Screen interface
+    }
+    if (homeKey[3].justPressed()) homeKey[3].drawButton(true);
+}
+
+
+// Handles touch events on the manual screen
+void manual_touch() {
+    uint16_t t_x, t_y;
+    bool pressed = tft.getTouch(&t_x, &t_y);
+
+    // --- Handle Main Action Keys (Top Right) ---
+    for(int i=0; i<4; i++) {
+        if (pressed && manualKey[i].contains(t_x, t_y)) manualKey[i].press(true);
+        else manualKey[i].press(false);
+
+        if(manualKey[i].justReleased()) manualKey[i].drawButton();
+        if(manualKey[i].justPressed()) manualKey[i].drawButton(true);
+    }
+
+    // HOME A (Index 0)
+    if(manualKey[0].justReleased()) {
+        Serial.println("Manual Home key pressed");
+        selected_interface = 1; // Go Home
+    }
+
+    // START B (Index 1)
+    if(manualKey[1].justReleased()) {
+        Serial.println("Manual Start key pressed");
+        // Validate inputs before starting
+        if (manual_dry_temp_str.length() > 0 && manual_wet_temp_str.length() > 0) {
+             int temp_db = manual_dry_temp_str.toInt();
+             int temp_wb = manual_wet_temp_str.toInt();
+
+             // Basic validation (add more checks if needed)
+             if (temp_db >= 0 && temp_wb >= 0 && temp_db >= temp_wb) {
+                 confirmation_screen("Start MANUAL?");
+                 currentState = STATE_CONFIRM_WAIT_MANUAL;
+                 stateStartTime = millis();
+                 selected_interface = 4; // Go to confirmation
+             } else {
+                 Serial.println("Invalid Manual Temp Values!");
+                 warning_section(2, 150); // Error beep
+                 // Optionally display error message on TFT
+             }
+        } else {
+            Serial.println("Manual Temp Values Missing!");
+            warning_section(2, 150); // Error beep
+        }
+    }
+
+    // <-- C (BACKSPACE) (Index 2)
+    if(manualKey[2].justReleased()) {
+         Serial.println("Manual Backspace key pressed");
+         if(selected_manual_field == 1 && manual_dry_temp_str.length() > 0){
+            manual_dry_temp_str.remove(manual_dry_temp_str.length() - 1);
+            print_manual_dry_value();
+         } else if (selected_manual_field == 2 && manual_wet_temp_str.length() > 0){
+             manual_wet_temp_str.remove(manual_wet_temp_str.length() - 1);
+             print_manual_wet_value();
+         }
+         delay(50); // Short delay after action
+    }
+
+    // RESET D (CLEAR FIELDS) (Index 3)
+     if(manualKey[3].justReleased()) {
+         Serial.println("Manual Reset Fields key pressed");
+         manual_dry_temp_str = "";
+         manual_wet_temp_str = "";
+         selected_manual_field = 1;
+         field_change_update(); // Update display
+         delay(50);
+     }
+
+
+    // --- Handle Keypad Input ---
+    for(int i=0; i<16; i++) {
+        if (pressed && manualKeypadKey[i].contains(t_x, t_y)) manualKeypadKey[i].press(true);
+        else manualKeypadKey[i].press(false);
+
+        if(manualKeypadKey[i].justReleased()) {
+            manualKeypadKey[i].drawButton(); // Redraw normal
+            char* label = manualKeypadKeyLabel[i];
+            Serial.print("Manual Keypad: "); Serial.println(label);
+
+            if (strcmp(label, "U") == 0) { // UP
+                selected_manual_field--;
+                if (selected_manual_field < 1) selected_manual_field = 2; // Cycle 1 -> 2 -> 1...
+                field_change_update();
+            } else if (strcmp(label, "D") == 0) { // DOWN
+                selected_manual_field++;
+                 if (selected_manual_field > 2) selected_manual_field = 1; // Cycle 1 -> 2 -> 1...
+                field_change_update();
+            } else if (strcmp(label, "<-") == 0) { // Backspace (redundant with main backspace?)
+                 if(selected_manual_field == 1 && manual_dry_temp_str.length() > 0){
+                    manual_dry_temp_str.remove(manual_dry_temp_str.length() - 1);
+                    print_manual_dry_value();
+                 } else if (selected_manual_field == 2 && manual_wet_temp_str.length() > 0){
+                     manual_wet_temp_str.remove(manual_wet_temp_str.length() - 1);
+                     print_manual_wet_value();
+                 }
+            } else if (strcmp(label, "OK") == 0) {
+                // Potentially trigger Start like button 'B'? Or just focus next field?
+                // Let's make it switch field for now
+                 selected_manual_field++;
+                 if (selected_manual_field > 2) selected_manual_field = 1;
+                 field_change_update();
+            } else if (strcmp(label, ".") == 0 || strcmp(label, ":") == 0) {
+                 // Ignore . and : for temp inputs
+                 warning_section(1, 100);
+            } else {
+                // Handle numeric input '0'-'9'
+                 update_field(label[0]); // Pass the character
+            }
+             delay(100); // Debounce/delay after keypad press
+        }
+        if(manualKeypadKey[i].justPressed()) manualKeypadKey[i].drawButton(true); // Show pressed state
+    }
+}
+
+// Handles touch events on the phase selection screen
+void phase_touch() {
+    uint16_t t_x, t_y;
+    bool pressed = tft.getTouch(&t_x, &t_y);
+
+    // Handle all 6 buttons
+    for(int i=0; i<6; i++) {
+        if (pressed && phaseKey[i].contains(t_x, t_y)) phaseKey[i].press(true);
+        else phaseKey[i].press(false);
+
+        if(phaseKey[i].justReleased()) {
+            phaseKey[i].drawButton(); // Redraw normal state
+
+            // Actions based on button index
+            if (i >= 0 && i <= 3) { // Phase selection buttons (0-3)
+                Serial.print("Phase Select key "); Serial.println(i + 1);
+                temp_phase_select = i + 1; // Set temporary selection (1-4)
+                update_phase_field();
+                update_phase_time_field();
+            } else if (i == 4) { // START A (Index 4)
+                 Serial.println("Phase Start key pressed");
+                 if (temp_phase_select >= 1 && temp_phase_select <= 4) { // Check if a valid phase is selected
+                     confirmation_screen("Start PHASE?");
+                     currentState = STATE_CONFIRM_WAIT_PHASE;
+                     stateStartTime = millis();
+                     selected_interface = 4; // Go to confirmation screen
+                 } else {
+                     Serial.println("No phase selected to start!");
+                     warning_section(2, 150); // Error beep
+                 }
+            } else if (i == 5) { // HOME B (Index 5)
+                 Serial.println("Phase Home key pressed");
+                 selected_interface = 1; // Go Home
+                 temp_phase_select = 0; // Reset selection when leaving screen
+            }
+            delay(100); // Debounce/delay
+        }
+        if(phaseKey[i].justPressed()) phaseKey[i].drawButton(true); // Show pressed state
+    }
+}
+
+// Handles touch on the confirmation screen
+void confirm_touch() {
+    uint16_t t_x, t_y;
+    bool pressed = tft.getTouch(&t_x, &t_y);
+    const unsigned long CONFIRM_TIMEOUT = 15000; // 15 second timeout
+
+    // Handle timeout
+    if (millis() - stateStartTime > CONFIRM_TIMEOUT) {
+        Serial.println("Confirmation Timeout!");
+        confirm = 2; // Timeout acts as "NO"
+        currentState = STATE_IDLE; // Reset state machine
+        selected_interface = 1; // Go back home
+        pre_interface = 0; // Force redraw home
+        warning_section(1, 500); // Long beep for timeout
+        return; // Exit function
+    }
+
+    // Handle button presses
+    for(int i=0; i<2; i++) {
+         if (pressed && confirmKey[i].contains(t_x, t_y)) confirmKey[i].press(true);
+         else confirmKey[i].press(false);
+
+        // Use justReleased for actions
+        if (confirmKey[i].justReleased()) {
+            confirmKey[i].drawButton(); // Redraw normal
+            if (i == 0) { // YES button
+                Serial.println("Confirm YES");
+                confirm = 1;
+            } else { // NO button
+                 Serial.println("Confirm NO");
+                 confirm = 2;
+            }
+            // Don't immediately change interface here, let the state machine handle it
+        }
+        if (confirmKey[i].justPressed()) confirmKey[i].drawButton(true);
+    }
+}
+
+// Handles physical keypad events
+void keypadEvent(KeypadEvent key) {
+     Serial.print("Keypad Event: "); Serial.println(key);
+
+     switch (keypad.getState()){
+        case PRESSED:
+             // --- Home Screen Keypad Shortcuts ---
+             if (selected_interface == 1) {
+                 if (key == 'A') { // Manual Shortcut
+                     if (isModeHeld) {
+                          manual_dry_temp_str = ""; manual_wet_temp_str = ""; selected_manual_field = 1;
+                          selected_interface = 2;
+                     } else {
+                          manual_dry_temp_str = ""; manual_wet_temp_str = ""; selected_manual_field = 1;
+                          selected_interface = 2;
+                     }
+                     delay(200); // Debounce
+                 } else if (key == 'B') { // Hold/Resume Shortcut
+                     // Simulate touch release for Hold/Resume button
+                     if (isModeHeld) { // RESUME
+                         restoreHoldStateFromEEPROM();
+                         isModeHeld = false;
+                         cur_time_flag = true; alarmable = true;
+                         digitalWrite(relay1, LOW); digitalWrite(relay2, LOW);
+                         pre_time = millis(); pre_eeprom_time = millis();
+                         selected_interface = 1; pre_interface = 0;
+                     } else { // HOLD
+                         if (selected_mode != 0 && cur_time_flag) {
+                             saveHoldStateToEEPROM();
+                             isModeHeld = true; cur_time_flag = false;
+                             // Reset current state
+                             selected_mode = 0; selected_phase = 0; hour = 0; minute = 0; second = 0;
+                             limit_hour = 0; limit_min = 0; limit_sec = 0; limit_db = 0; limit_wb = 0;
+                             set_dry_temp_str = " -- F"; set_wet_temp_str = " -- F";
+                             home_cur_time_str = "00:00:00"; home_limit_time_str = "00:00:00";
+                             digitalWrite(relay1, LOW); digitalWrite(relay2, LOW);
+                             selected_interface = 1; pre_interface = 0;
+                             warning_section(1, 300);
+                         } else { warning_section(2, 100); }
+                     }
+                      delay(200);
+                 } else if (key == 'C') { // Phase Shortcut
+                     selected_interface = 3;
+                      delay(200);
+                 } else if (key == 'D') { // Reset Shortcut
+                     confirmation_screen("RESET System?");
+                     currentState = STATE_CONFIRM_WAIT_RESET;
+                     stateStartTime = millis();
+                     selected_interface = 4;
+                      delay(200);
+                 }
+             }
+             // --- Manual Screen Keypad Actions ---
+             else if (selected_interface == 2) {
+                  if (key >= '0' && key <= '9') { update_field(key); }
+                  else if (key == 'A') { selected_interface = 1; } // Home
+                  else if (key == 'B') { // Start Manual
+                        if (manual_dry_temp_str.length() > 0 && manual_wet_temp_str.length() > 0) {
+                             int temp_db = manual_dry_temp_str.toInt(); int temp_wb = manual_wet_temp_str.toInt();
+                             if (temp_db >= 0 && temp_wb >= 0 && temp_db >= temp_wb) {
+                                 confirmation_screen("Start MANUAL?"); currentState = STATE_CONFIRM_WAIT_MANUAL;
+                                 stateStartTime = millis(); selected_interface = 4;
+                             } else { warning_section(2, 150); }
+                        } else { warning_section(2, 150); }
+                  }
+                  else if (key == 'C') { // Backspace
+                        if(selected_manual_field == 1 && manual_dry_temp_str.length() > 0){ manual_dry_temp_str.remove(manual_dry_temp_str.length() - 1); print_manual_dry_value(); }
+                        else if (selected_manual_field == 2 && manual_wet_temp_str.length() > 0){ manual_wet_temp_str.remove(manual_wet_temp_str.length() - 1); print_manual_wet_value(); }
+                  }
+                   else if (key == 'D') { // Field Down
+                        selected_manual_field++; if (selected_manual_field > 2) selected_manual_field = 1;
+                        field_change_update();
+                   }
+                   delay(200); // Debounce for manual screen keypad
+             }
+              // --- Phase Screen Keypad Actions ---
+              else if (selected_interface == 3) {
+                   if (key >= '1' && key <= '4') { // Select Phase 1-4
+                       temp_phase_select = key - '0'; // Convert char '1'..'4' to int 1..4
+                       update_phase_field();
+                       update_phase_time_field();
+                   } else if (key == 'A') { // Start Phase
+                       if (temp_phase_select >= 1 && temp_phase_select <= 4) {
+                           confirmation_screen("Start PHASE?"); currentState = STATE_CONFIRM_WAIT_PHASE;
+                           stateStartTime = millis(); selected_interface = 4;
+                       } else { warning_section(2, 150); }
+                   } else if (key == 'B') { // Home
+                       selected_interface = 1; temp_phase_select = 0;
+                   }
+                    delay(200);
+              }
+               // --- Confirmation Screen Keypad Actions ---
+              else if (selected_interface == 4) {
+                   if (key == '*') { confirm = 1; } // YES
+                   else if (key == '#') { confirm = 2; } // NO
+                    delay(200);
+              }
+             break;
+
+         case RELEASED: // Optional: Handle key release if needed
+              break;
+
+         case HOLD: // Optional: Handle key hold if needed
+              break;
+
+         case IDLE: // Default state
+              break;
+     }
+}
+
+// Updates the currently selected manual input field
+void update_field(char ch) {
+    switch(selected_manual_field){
+        case 1: // DRY BULB
+            if(manual_dry_temp_str.length() < 3) { // Limit to 3 digits
+                manual_dry_temp_str += ch;
+            } else { warning_section(1, 100); } // Beep if full
+            print_manual_dry_value();
+            break;
+        case 2: // WET BULB
+            if(manual_wet_temp_str.length() < 3) {
+                manual_wet_temp_str += ch;
+            } else { warning_section(1, 100); }
+            print_manual_wet_value();
+            break;
+        // case 3: // TIME - Removed Manual Time Input
+        //     break;
+    }
+}
+
+// Refreshes the manual input fields display (e.g., after focus change)
+void field_change_update() {
+    print_manual_dry_value();
+    print_manual_wet_value();
+    // print_manual_time_value(); // Removed
+}
+
+// Updates the displayed selected phase on the phase screen
+void update_phase_field() {
+    print_phase_select_value();
+}
+
+// Calculates and updates the displayed time for the selected phase
+void update_phase_time_field() {
+    if (temp_phase_select >= 1 && temp_phase_select <= 4) {
+        phase_time_value_str = time_to_str(
+            phase_duration_hour[temp_phase_select],
+            phase_duration_min[temp_phase_select],
+            phase_duration_sec[temp_phase_select]
+        );
+    } else {
+         phase_time_value_str = "00:00:00"; // Default if no phase selected
+    }
+    print_phase_manual_time_value();
+}
+
+// === Control Logic Functions ===
+
+// Selects which screen to display
+void interface_control() {
+    if (pre_interface == selected_interface) return; // No change
+
+    Serial.print("Switching interface from "); Serial.print(pre_interface);
+    Serial.print(" to "); Serial.println(selected_interface);
+
+    switch(selected_interface){
+        case 1: home_screen(); break;
+        case 2: manual_screen(); break;
+        case 3: phase_screen(); break;
+        case 4:
+            // Confirmation screen is drawn by the functions calling it
+            // No need to redraw here unless coming from a different interface
+            if (pre_interface != 4) {
+                // confirmation_screen(); // Already drawn by caller
+            }
+            break;
+        default:
+             Serial.print("Unknown interface: "); Serial.println(selected_interface);
+             selected_interface = 1; // Default to home
+             home_screen();
+             break;
+    }
+    pre_interface = selected_interface; // Update previous interface tracker
+}
+
+// Routes touch input to the correct handler based on the current screen
+void touch_control_router() {
+    switch(selected_interface){
+        case 1: home_touch(); break;
+        case 2: manual_touch(); break;
+        case 3: phase_touch(); break;
+        case 4: confirm_touch(); break;
+    }
+}
+
+// Manages state transitions, especially confirmations
+void handle_state_machine() {
+    // No confirmation pending or action needed
+    if (currentState == STATE_IDLE || currentState == STATE_PROCESS_RUNNING) {
+         // If a process finished naturally (not hold/reset), go idle
+         if (!cur_time_flag && selected_mode != 0 && currentState == STATE_PROCESS_RUNNING) {
+              Serial.println("Process finished naturally. Resetting state.");
+              resetProcess(); // Reset variables, go to Idle state
+              currentState = STATE_IDLE;
+              selected_interface = 1; // Go home
+              pre_interface = 0; // Force redraw
+         } else if (cur_time_flag && selected_mode != 0) {
+              currentState = STATE_PROCESS_RUNNING; // Ensure state is correct if running
+         }
+         else {
+             currentState = STATE_IDLE; // Ensure idle if not running
+         }
+        confirm = 0; // Clear any stray confirm flags
+        return;
+    }
+
+    // --- Handle Confirmation States ---
+    if (confirm == 1) { // YES confirmed
+        Serial.print("State Machine Confirmed YES for state: "); Serial.println(currentState);
+        switch(currentState) {
+            case STATE_CONFIRM_WAIT_AUTO:
+                 Serial.println("Starting AUTO Mode...");
+                 selected_mode = 1; selected_phase = 1; // Start with Phase 1
+                 hour = 0; minute = 0; second = 0;
+                 limit_hour = phase_duration_hour[selected_phase];
+                 limit_min = phase_duration_min[selected_phase];
+                 limit_sec = phase_duration_sec[selected_phase];
+
+                 if (hour < 40) { // Check bounds for temperature array
+                      limit_db = phase_temp2[selected_phase - 1][hour][0];
+                      limit_wb = phase_temp2[selected_phase - 1][hour][1];
+                 } else { limit_db = 0; limit_wb = 0; } // Safe default
+
+                 set_dry_temp_str = String(limit_db) + " F";
+                 set_wet_temp_str = String(limit_wb) + " F";
+                 cur_time_flag = true; alarmable = true;
+                 writeIntToEEPROM(EEPROM_FLAG1, 0); // Invalidate previous saves before starting new
+                 writeIntToEEPROM(EEPROM_FLAG2, 0);
+                 flip = true; // Start saving in slot 1
+                 pre_eeprom_time = millis(); pre_time = millis();
+                 currentState = STATE_PROCESS_RUNNING;
+                 selected_interface = 1; // Go back home to view progress
+                 pre_interface = 0; // Force redraw home screen
+                break;
+
+            case STATE_CONFIRM_WAIT_RESET:
+                Serial.println("Performing RESET...");
+                resetProcess(); // Clear current state variables
+                clearHoldStateInEEPROM(); // Clear any held state
+                writeIntToEEPROM(EEPROM_FLAG1, 0); // Clear power-loss recovery flags
+                writeIntToEEPROM(EEPROM_FLAG2, 0);
+                delay(100);
+                ESP.restart();
+                break; // Will not be reached after restart
+
+            case STATE_CONFIRM_WAIT_MANUAL:
+                Serial.println("Starting MANUAL Mode...");
+                // Get values from input strings
+                limit_db = manual_dry_temp_str.toInt();
+                limit_wb = manual_wet_temp_str.toInt();
+                // Manual mode runs indefinitely, time limits are ignored
+                hour = 0; minute = 0; second = 0;
+                limit_hour = 0; limit_min = 0; limit_sec = 0; // No time limit for manual
+                selected_mode = 3; selected_phase = 0; // Manual mode, no phase
+                set_dry_temp_str = String(limit_db) + " F";
+                set_wet_temp_str = String(limit_wb) + " F";
+                cur_time_flag = true; alarmable = false; // No time-based alarm for manual
+                writeIntToEEPROM(EEPROM_FLAG1, 0);
+                writeIntToEEPROM(EEPROM_FLAG2, 0);
+                flip = true;
+                pre_eeprom_time = millis(); pre_time = millis();
+                currentState = STATE_PROCESS_RUNNING;
+                selected_interface = 1; // Go home
+                pre_interface = 0;
+                break;
+
+             case STATE_CONFIRM_WAIT_PHASE:
+                 Serial.println("Starting Single PHASE Mode...");
+                 selected_phase = temp_phase_select; // Use the phase selected on the phase screen
+                 selected_mode = 2; // Phase mode
+                 hour = 0; minute = 0; second = 0;
+                 limit_hour = phase_duration_hour[selected_phase];
+                 limit_min = phase_duration_min[selected_phase];
+                 limit_sec = phase_duration_sec[selected_phase];
+
+                 if (hour < 40) { // Check bounds
+                     limit_db = phase_temp2[selected_phase - 1][hour][0];
+                     limit_wb = phase_temp2[selected_phase - 1][hour][1];
+                 } else { limit_db = 0; limit_wb = 0; }
+
+                 set_dry_temp_str = String(limit_db) + " F";
+                 set_wet_temp_str = String(limit_wb) + " F";
+                 cur_time_flag = true; alarmable = true;
+                 writeIntToEEPROM(EEPROM_FLAG1, 0);
+                 writeIntToEEPROM(EEPROM_FLAG2, 0);
+                 flip = true;
+                 pre_eeprom_time = millis(); pre_time = millis();
+                 currentState = STATE_PROCESS_RUNNING;
+                 selected_interface = 1; // Go home
+                 pre_interface = 0;
+                 temp_phase_select = 0; // Clear temporary selection
+                 break;
+
+            // Add cases for HOLD/RESUME confirmation if needed (currently handled directly in touch)
+            // case STATE_CONFIRM_WAIT_HOLD:
+            //     break;
+
+            default:
+                 currentState = STATE_IDLE; // Go idle if state unexpected
+                 selected_interface = 1; // Go home
+                 pre_interface = 0;
+                 break;
+        }
+        confirm = 0; // Reset confirmation flag
+
+    } else if (confirm == 2) { // NO confirmed
+         Serial.print("State Machine Confirmed NO for state: "); Serial.println(currentState);
+         confirm = 0; // Reset confirmation flag
+         currentState = STATE_IDLE; // Go back to idle state
+         selected_interface = 1; // Go back home
+         pre_interface = 0; // Force redraw home screen
+    }
+    // If confirm is still 0, waiting for user input (handled by confirm_touch)
+}
+
+// Measure temperature from sensors
+void temp_measure() {
+    static uint64_t temp_pre_time = 0;
+    // Only measure if on home screen OR if a process is running
+    if (selected_interface == 1 || cur_time_flag) {
+         if(millis() - temp_pre_time >= 1000) { // Measure every second
+            sensor1.requestTemperatures();
+            sensor2.requestTemperatures();
+
+            // Add error handling for reading temps
+            float temp1_f = sensor1.getTempFByIndex(0);
+            float temp2_f = sensor2.getTempFByIndex(0);
+
+            // Check for valid readings (DS18B20 returns -196.6F or DEVICE_DISCONNECTED_F on error)
+            if (temp1_f > -100 && temp1_f < 260) { // Plausible range check
+                 tempF[0] = temp1_f;
+                 dry_temp_str = String(int(tempF[0])) + " F";
+            } else {
+                 tempF[0] = -999; // Indicate error
+                 dry_temp_str = "ERR F";
+                 Serial.println("Error reading Sensor 1 (Dry)");
+            }
+
+             if (temp2_f > -100 && temp2_f < 260) {
+                 tempF[1] = temp2_f;
+                  wet_temp_str = String(int(tempF[1])) + " F";
+             } else {
+                 tempF[1] = -999; // Indicate error
+                 wet_temp_str = "ERR F";
+                  Serial.println("Error reading Sensor 2 (Wet)");
+             }
+
+            // Only update display if on home screen
+            if (selected_interface == 1) {
+                print_db_temp();
+                print_wb_temp();
+            }
+
+            temp_pre_time = millis();
+         }
+    }
+}
+
+// Check sensor readings and trigger warning
+void handleTemperatureSensors() {
+    // Check if sensors read error values (-999 assigned in temp_measure)
+    if ((tempF[0] == -999 || tempF[1] == -999) && selected_interface == 1) {
+        // Optional: Implement a warning screen or persistent error message
+        sensor_warning(); // Flash buzzer briefly
+    }
+}
+
+// Control relays based on current temp and setpoints
+void temp_control() {
+     // Only control temps if a mode is actively running
+     if (!cur_time_flag || selected_mode == 0 || isModeHeld) {
+          digitalWrite(relay1, LOW); // Ensure relays are off if not running or held
+          digitalWrite(relay2, LOW);
+          return;
+     }
+
+    // Basic On/Off control (Add hysteresis later if needed)
+    int db = int(tempF[0]);
+    int wb = int(tempF[1]);
+
+    // Check if sensor readings are valid before controlling
+    if (db != -999 && limit_db > 0) { // Only control if reading is valid and setpoint is positive
+        if (db < limit_db) {
+            digitalWrite(relay1, HIGH); // Need heat
+        } else {
+            digitalWrite(relay1, LOW); // Target reached or exceeded
+        }
+    } else {
+        digitalWrite(relay1, LOW); // Turn off if sensor error or zero setpoint
+    }
+
+    if (wb != -999 && limit_wb > 0) {
+        if (wb < limit_wb) {
+            digitalWrite(relay2, HIGH); // Need moisture/steam
+        } else {
+            digitalWrite(relay2, LOW); // Target reached or exceeded
+        }
+    } else {
+         digitalWrite(relay2, LOW); // Turn off if sensor error or zero setpoint
+    }
+}
+
+
+// Manage phase transitions and setpoint updates for Auto/Phase modes
+void phase_control() {
+    // Only run phase control if timer is active and in Auto or Phase mode, and not held
+    if (!cur_time_flag || (selected_mode != 1 && selected_mode != 2) || isModeHeld) {
+        alarmable = true; // Reset alarm capability if process stops/pauses
+        return;
+    }
+
+    // Update setpoints based on current hour within the current phase
+     // Use selected_phase consistently. Phase 1 corresponds to index 0 in arrays.
+     int current_phase_index = selected_phase - 1;
+
+     if (current_phase_index >= 0 && current_phase_index < 4) { // Valid phase index 0-3
+         // Check if hour is within the bounds of the temperature array for this phase
+         // Assuming phase_temp2 has 40 steps per phase (index 0-39)
+         if (hour >= 0 && hour < 40) {
+             int new_limit_db = phase_temp2[current_phase_index][hour][0];
+             int new_limit_wb = phase_temp2[current_phase_index][hour][1];
+
+             // Update setpoints only if they change
+             if (new_limit_db != limit_db || new_limit_wb != limit_wb) {
+                  limit_db = new_limit_db;
+                  limit_wb = new_limit_wb;
+                  set_dry_temp_str = String(limit_db) + " F";
+                  set_wet_temp_str = String(limit_wb) + " F";
+                  Serial.print("Phase Control Update: Phase="); Serial.print(selected_phase);
+                  Serial.print(" Hour="); Serial.print(hour);
+                  Serial.print(" -> DB="); Serial.print(limit_db);
+                  Serial.print(" WB="); Serial.println(limit_wb);
+                  // Update display if on home screen
+                  if (selected_interface == 1) {
+                       print_dbset_temp();
+                       print_wbset_temp();
+                  }
+             }
+         } else {
+              // Hour is out of bounds for the temp array, maybe phase ended early?
+              // Or use last known value? For now, set to 0.
+               if (limit_db != 0 || limit_wb != 0) {
+                    limit_db = 0; limit_wb = 0;
+                    set_dry_temp_str = " -- F"; set_wet_temp_str = " -- F";
+                     if (selected_interface == 1) { print_dbset_temp(); print_wbset_temp(); }
+                     Serial.println("Warning: Hour out of bounds for temp array in phase_control.");
+               }
+         }
+     } else if (selected_mode != 3) { // If not in Manual mode and phase is invalid (0 or >4)
+           // Should not happen if mode is Auto/Phase, but as a safeguard:
+           if (limit_db != 0 || limit_wb != 0) {
+                limit_db = 0; limit_wb = 0;
+                set_dry_temp_str = " -- F"; set_wet_temp_str = " -- F";
+                if (selected_interface == 1) { print_dbset_temp(); print_wbset_temp(); }
+           }
+     }
+
+
+    // Check if the current phase time limit is reached
+    bool timeReached = false;
+    if (hour > limit_hour) timeReached = true;
+    else if (hour == limit_hour) {
+        if (minute > limit_min) timeReached = true;
+        else if (minute == limit_min) {
+            if (second >= limit_sec) timeReached = true;
+        }
+    }
+
+    if (timeReached) {
+        if (alarmable) {
+            Serial.print("Phase "); Serial.print(selected_phase); Serial.println(" time reached.");
+            warning_section(5, 300); // Phase end alarm
+            alarmable = false; // Prevent continuous alarm
+            delay(10); // Short delay after alarm
+        }
+
+        // --- Handle Mode-Specific Actions on Time Reached ---
+        if (selected_mode == 1) { // AUTO Mode: Advance to next phase
+            selected_phase++;
+            if (selected_phase > 4) { // Auto cycle finished
+                Serial.println("AUTO Mode Finished!");
+                resetProcess(); // Reset all variables, stop timer
+                warning_section(3, 800); // Long completion alarm
+                // State machine will detect cur_time_flag is false and go IDLE
+            } else { // Go to next phase
+                Serial.print("AUTO Mode: Advancing to Phase "); Serial.println(selected_phase);
+                hour = 0; minute = 0; second = 0; // Reset timer for new phase
+                limit_hour = phase_duration_hour[selected_phase];
+                limit_min = phase_duration_min[selected_phase];
+                limit_sec = phase_duration_sec[selected_phase];
+                alarmable = true; // Allow alarm for next phase end
+                pre_time = millis(); // Reset 1-sec timer base
+
+                // Update display immediately
+                 home_limit_time_str = time_to_str(limit_hour, limit_min, limit_sec);
+                 if(selected_interface == 1) {
+                     print_limittime();
+                     print_phase();
+                     print_curtime(); // Reset displayed current time
+                 }
+                 // Setpoints will be updated by the next phase_control() run based on new phase/hour
+            }
+        } else if (selected_mode == 2) { // PHASE Mode: Single phase finished
+             Serial.println("PHASE Mode Finished!");
+             resetProcess();
+             warning_section(3, 800);
+             // State machine handles transition to IDLE
+        }
+        // Manual mode (selected_mode == 3) doesn't have time limits handled here.
+    }
+}
+
+// Increments the timer when active
+void handleTimerUpdate() {
+    pre_time = cur_time; // Update base time for next 1-second check
+    second++;
+    if (second >= 60) {
+        minute++;
+        second = 0;
+        if (minute >= 60) {
+            hour++;
+            minute = 0;
+             // Setpoints might change hourly in Auto/Phase modes
+             // The phase_control function already handles this based on 'hour'
+             // So no explicit update needed here unless logic changes.
+        }
+        // Update non-second parts of time display less frequently
+         if (selected_interface == 1) {
+              // Update hh:mm part less often if needed for performance
+              print_curtime();
+              // Also update set temps display periodically (e.g., every minute)
+              // This is now handled within phase_control when they change.
+              // print_dbset_temp();
+              // print_wbset_temp();
+         }
+    } else {
+         // Update only seconds part of display more frequently if needed
+         if (selected_interface == 1) {
+             print_curtime(); // Update full time every second for now
+         }
+    }
+}
+
+// Handles periodic saving to EEPROM for power loss recovery
+void handleEEPROMUpdate() {
+    // ONLY save if a mode is running AND it's NOT HELD
+    if (cur_time_flag && selected_mode != 0 && !isModeHeld) {
+        pre_eeprom_time = cur_time; // Update base time for next save check
+        saveStateToEEPROM(flip);   // Save to the alternate slot
+        flip = !flip;              // Toggle slot for next time
+    } else {
+        // If not running or is held, ensure flags are clear?
+        // No, clearing flags here might erase a valid recovery state
+        // if the user holds then immediately loses power.
+        // Flags are cleared explicitly on Reset or successful start.
+    }
+}
+
+// Central function to reset process variables to idle state
+void resetProcess() {
+    Serial.println("Resetting process variables...");
+    hour = 0; minute = 0; second = 0;
+    limit_hour = 0; limit_min = 0; limit_sec = 0;
+    limit_db = 0; limit_wb = 0;
+    selected_phase = 0;
+    selected_mode = 0; // Set mode to Idle
+    cur_time_flag = false; // Stop timer
+    alarmable = true; // Reset alarm capability
+
+    // Reset display strings
+    set_dry_temp_str = " -- F";
+    set_wet_temp_str = " -- F";
+    home_cur_time_str = "00:00:00";
+    home_limit_time_str = "00:00:00";
+
+    // Ensure relays are off
+    digitalWrite(relay1, LOW);
+    digitalWrite(relay2, LOW);
+
+    // Clear manual input fields if in manual screen? No, reset happens from home mostly.
+    // manual_dry_temp_str = "";
+    // manual_wet_temp_str = "";
+
+     // Update the UI if on the home screen
+     if (selected_interface == 1) {
+         update_ui_elements();
+     }
+}
+
+
+// === Utility Functions ===
+
+void warning_section(int ct, int duration) {
+    for (int i = 0; i < ct; i++) {
+        tone(buzzer, 1500, duration); // Use tone with duration
+        delay(duration + 50); // Wait for tone to finish plus small gap
+        // noTone(buzzer); // Not needed with timed tone
+        if (i < ct - 1) delay(duration / 2); // Gap between beeps
+    }
+}
+
+void sensor_warning() {
+     // Short, less intrusive warning for sensor error during measurement
+     tone(buzzer, 800, 100); // Low pitch, short duration
+}
+
+
+// === Arduino Setup ===
+void setup() {
+    delay(1000); // Wait for hardware stabilization
+    Serial.begin(115200);
+    Serial.println("\n=== System Initializing ===");
+
+    Wire.begin(); // Initialize I2C for EEPROM
+    tft.init();
+    tft.setRotation(0); // Adjust rotation if needed (0, 1, 2, 3)
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(10, 10);
+    tft.setTextFont(2); // Use a standard font
+    tft.println("Loading...");
+
+    // Initialize SPIFFS for calibration data
+    if (!SPIFFS.begin(true)) { // Format SPIFFS if not mounted
+        Serial.println("SPIFFS Mount Failed - Formatting...");
+         tft.println("Formatting Storage...");
+         if(!SPIFFS.format()){
+             Serial.println("SPIFFS Format Failed!");
+              tft.println("Storage Format FAILED!");
+              while(1); // Halt on critical error
+         }
+         // Try mounting again after format
+         if (!SPIFFS.begin(true)) {
+             Serial.println("SPIFFS Mount Failed after Format!");
+             tft.println("Storage Mount FAILED!");
+             while(1); // Halt
+         }
+    }
+    Serial.println("SPIFFS Mounted.");
+     tft.println("Storage OK.");
+
+    touch_calibrate(); // Calibrate or load calibration
+     tft.println("Touch OK.");
+
+    keypad.addEventListener(keypadEvent); // Register keypad listener
+    Serial.println("Keypad Initialized.");
+     tft.println("Keypad OK.");
+
+    pinMode(relay1, OUTPUT); digitalWrite(relay1, LOW);
+    pinMode(relay2, OUTPUT); digitalWrite(relay2, LOW);
+    pinMode(buzzer, OUTPUT); digitalWrite(buzzer, LOW); // Ensure buzzer is off
+    Serial.println("Pins Initialized.");
+     tft.println("Peripherals OK.");
+
+    // --- State Restoration ---
+    Serial.println("Checking EEPROM states...");
+    // Check if a mode was HELD during power loss
+    isModeHeld = (readIntFromEEPROM(HOLD_EEPROM_FLAG) == 1);
+    if (isModeHeld) {
+        Serial.println("Hold flag was active in EEPROM. Clearing hold state on startup.");
+        clearHoldStateInEEPROM(); // Clear the hold state - Hold does not survive power loss
+        isModeHeld = false; // Update runtime flag
+    } else {
+        Serial.println("No active Hold flag found.");
+    }
+
+    // Check for regular power loss recovery state
+    check_eeprom_recovery(); // Tries to restore from Slot 1 or 2
+
+    Serial.println("Initialization Complete.");
+     tft.println("Ready.");
+    delay(1500); // Show "Ready" message briefly
+
+    // Initial Screen Draw
+    selected_interface = 1;
+    pre_interface = 0; // Force initial draw
+    interface_control(); // Draw the initial home screen
+
+    // Start temperature sensors
+    sensor1.begin();
+    sensor2.begin();
+    // Optional: Check sensor connection here
+    temp_measure(); // Get initial readings
+
+    pre_time = millis(); // Initialize timer bases
+    pre_eeprom_time = millis();
+}
+
+// === Arduino Loop ===
+void loop() {
+    cur_time = millis(); // Get current time at the start of the loop
+
+    // 1. Handle Inputs
+    touch_control_router(); // Check for touch events based on current screen
+    keypad.getKey();      // Scan keypad (event handler deals with presses)
+
+    // 2. Update State Machine (handles confirmations, transitions)
+    handle_state_machine();
+
+    // 3. Update Core Logic based on State
+    temp_measure(); // Read sensors (conditionally based on interface/state)
+    // handleTemperatureSensors(); // Check sensor readings for errors
+    if (cur_time_flag && !isModeHeld) { // Only run process logic if active and not held
+         phase_control(); // Update setpoints based on time/phase (for Auto/Phase)
+         temp_control();  // Control relays based on current temp/setpoints
+    } else {
+         // Ensure relays are off if not running or held
+         digitalWrite(relay1, LOW);
+         digitalWrite(relay2, LOW);
+    }
+
+
+    // 4. Update Timers & Periodic Saves
+    // Timer Increment (every second)
+    if (cur_time_flag && !isModeHeld && (cur_time - pre_time >= 1000)) {
+        handleTimerUpdate(); // Increments s/m/h and updates time display
+    }
+    // EEPROM Save (every minute, approx)
+     if (cur_time_flag && !isModeHeld && (cur_time - pre_eeprom_time >= 60000)) {
+         handleEEPROMUpdate(); // Saves state to EEPROM slots 1/2
+     }
+
+    // 5. Update Display (only if necessary)
+    interface_control(); // Switches screen visuals if selected_interface changed
+    if (selected_interface == 1) {
+         // Potentially update dynamic elements less frequently if performance is an issue
+         // update_ui_elements(); // Already called by print_curtime/handleTimerUpdate etc.
+         // Make sure hold status is updated if it changes
+         static bool lastHoldState = false;
+         if (isModeHeld != lastHoldState) {
+              print_hold_status(); // Redraw hold status indicator if it changed
+              draw_home_keypad();  // Redraw buttons to update Hold/Resume label
+              lastHoldState = isModeHeld;
+         }
+    }
+
+     // Small delay to prevent overly tight loop (optional)
+     // delay(10);
+}
